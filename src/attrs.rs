@@ -192,6 +192,105 @@ impl FontFeatures {
     }
 }
 
+/// A 4-byte `OpenType` variation axis tag.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct VariationTag([u8; 4]);
+
+impl VariationTag {
+    /// Create a variation axis tag from its four-byte representation.
+    pub const fn new(tag: &[u8; 4]) -> Self {
+        Self(*tag)
+    }
+
+    /// Return the four-byte representation of this axis tag.
+    pub const fn as_bytes(&self) -> &[u8; 4] {
+        &self.0
+    }
+}
+
+/// A variation coordinate with stable equality and hashing for shape caches.
+#[derive(Clone, Copy, Debug)]
+pub struct VariationValue(pub f32);
+
+impl PartialEq for VariationValue {
+    fn eq(&self, other: &Self) -> bool {
+        if self.0.is_nan() {
+            other.0.is_nan()
+        } else {
+            self.0 == other.0
+        }
+    }
+}
+
+impl Eq for VariationValue {}
+
+impl Hash for VariationValue {
+    fn hash<H: Hasher>(&self, hasher: &mut H) {
+        const CANONICAL_NAN_BITS: u32 = 0x7fc0_0000;
+
+        let bits = if self.0.is_nan() {
+            CANONICAL_NAN_BITS
+        } else {
+            // Add +0.0 to canonicalize -0.0 to +0.0.
+            (self.0 + 0.0).to_bits()
+        };
+
+        bits.hash(hasher);
+    }
+}
+
+/// One `OpenType` variation axis coordinate.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct FontVariation {
+    pub tag: VariationTag,
+    pub value: VariationValue,
+}
+
+/// Variation coordinates applied while shaping a text span.
+#[derive(Clone, Debug, Default, Eq, Hash, PartialEq)]
+pub struct FontVariations {
+    variations: Vec<FontVariation>,
+}
+
+impl FontVariations {
+    pub fn new() -> Self {
+        Self {
+            variations: Vec::new(),
+        }
+    }
+
+    /// Set an axis coordinate. Setting the same tag again replaces its value,
+    /// matching the last-value-wins behavior of CSS variation settings.
+    pub fn set(&mut self, tag: VariationTag, value: f32) -> &mut Self {
+        match self
+            .variations
+            .binary_search_by_key(&tag, |variation| variation.tag)
+        {
+            Ok(index) => self.variations[index].value = VariationValue(value),
+            Err(index) => self.variations.insert(
+                index,
+                FontVariation {
+                    tag,
+                    value: VariationValue(value),
+                },
+            ),
+        }
+        self
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.variations.is_empty()
+    }
+
+    pub fn len(&self) -> usize {
+        self.variations.len()
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = &FontVariation> {
+        self.variations.iter()
+    }
+}
+
 /// A wrapper for letter spacing to get around that f32 doesn't implement Eq and Hash
 #[derive(Clone, Copy, Debug)]
 pub struct LetterSpacing(pub f32);
@@ -229,6 +328,9 @@ pub struct Attrs<'a> {
     //TODO: should this be an option?
     pub color_opt: Option<Color>,
     pub family: Family<'a>,
+    /// A specific database face selected by the caller. Font fallback remains
+    /// available when that face does not contain a requested glyph.
+    pub font_id_opt: Option<fontdb::ID>,
     pub stretch: Stretch,
     pub style: Style,
     pub weight: Weight,
@@ -238,6 +340,7 @@ pub struct Attrs<'a> {
     /// Letter spacing (tracking) in EM
     pub letter_spacing_opt: Option<LetterSpacing>,
     pub font_features: FontFeatures,
+    pub font_variations: FontVariations,
 }
 
 impl<'a> Attrs<'a> {
@@ -248,6 +351,7 @@ impl<'a> Attrs<'a> {
         Self {
             color_opt: None,
             family: Family::SansSerif,
+            font_id_opt: None,
             stretch: Stretch::Normal,
             style: Style::Normal,
             weight: Weight::NORMAL,
@@ -256,6 +360,7 @@ impl<'a> Attrs<'a> {
             metrics_opt: None,
             letter_spacing_opt: None,
             font_features: FontFeatures::new(),
+            font_variations: FontVariations::new(),
         }
     }
 
@@ -268,6 +373,12 @@ impl<'a> Attrs<'a> {
     /// Set [Family]
     pub fn family(mut self, family: Family<'a>) -> Self {
         self.family = family;
+        self
+    }
+
+    /// Prefer one exact database face before ordinary family matching.
+    pub fn font_id(mut self, font_id: fontdb::ID) -> Self {
+        self.font_id_opt = Some(font_id);
         self
     }
 
@@ -319,6 +430,18 @@ impl<'a> Attrs<'a> {
         self
     }
 
+    /// Set all variation coordinates used while shaping.
+    pub fn font_variations(mut self, font_variations: FontVariations) -> Self {
+        self.font_variations = font_variations;
+        self
+    }
+
+    /// Set one variation coordinate used while shaping.
+    pub fn font_variation(mut self, tag: VariationTag, value: f32) -> Self {
+        self.font_variations.set(tag, value);
+        self
+    }
+
     /// Check if font matches
     pub fn matches(&self, face: &fontdb::FaceInfo) -> bool {
         //TODO: smarter way of including emoji
@@ -329,9 +452,11 @@ impl<'a> Attrs<'a> {
     /// Check if this set of attributes can be shaped with another
     pub fn compatible(&self, other: &Self) -> bool {
         self.family == other.family
+            && self.font_id_opt == other.font_id_opt
             && self.stretch == other.stretch
             && self.style == other.style
             && self.weight == other.weight
+            && self.font_variations == other.font_variations
     }
 }
 
@@ -361,6 +486,7 @@ pub struct AttrsOwned {
     //TODO: should this be an option?
     pub color_opt: Option<Color>,
     pub family_owned: FamilyOwned,
+    pub font_id_opt: Option<fontdb::ID>,
     pub stretch: Stretch,
     pub style: Style,
     pub weight: Weight,
@@ -370,6 +496,7 @@ pub struct AttrsOwned {
     /// Letter spacing (tracking) in EM
     pub letter_spacing_opt: Option<LetterSpacing>,
     pub font_features: FontFeatures,
+    pub font_variations: FontVariations,
 }
 
 impl AttrsOwned {
@@ -377,6 +504,7 @@ impl AttrsOwned {
         Self {
             color_opt: attrs.color_opt,
             family_owned: FamilyOwned::new(attrs.family),
+            font_id_opt: attrs.font_id_opt,
             stretch: attrs.stretch,
             style: attrs.style,
             weight: attrs.weight,
@@ -385,6 +513,7 @@ impl AttrsOwned {
             metrics_opt: attrs.metrics_opt,
             letter_spacing_opt: attrs.letter_spacing_opt,
             font_features: attrs.font_features.clone(),
+            font_variations: attrs.font_variations.clone(),
         }
     }
 
@@ -392,6 +521,7 @@ impl AttrsOwned {
         Attrs {
             color_opt: self.color_opt,
             family: self.family_owned.as_family(),
+            font_id_opt: self.font_id_opt,
             stretch: self.stretch,
             style: self.style,
             weight: self.weight,
@@ -400,6 +530,7 @@ impl AttrsOwned {
             metrics_opt: self.metrics_opt,
             letter_spacing_opt: self.letter_spacing_opt,
             font_features: self.font_features.clone(),
+            font_variations: self.font_variations.clone(),
         }
     }
 }
@@ -502,5 +633,62 @@ impl AttrsList {
         self.defaults = AttrsOwned::new(default);
         self.spans.clear();
         self
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Attrs, AttrsOwned, FontVariations, VariationTag};
+    use core::hash::{Hash, Hasher};
+    use std::collections::hash_map::DefaultHasher;
+
+    fn hash(value: impl Hash) -> u64 {
+        let mut hasher = DefaultHasher::new();
+        value.hash(&mut hasher);
+        hasher.finish()
+    }
+
+    #[test]
+    fn variation_coordinates_round_trip_and_change_shape_identity() {
+        let defaults = Attrs::new();
+        let varied = Attrs::new()
+            .font_variation(VariationTag::new(b"opsz"), 32.0)
+            .font_variation(VariationTag::new(b"wght"), 500.0);
+
+        assert!(!defaults.compatible(&varied));
+        assert_ne!(AttrsOwned::new(&defaults), AttrsOwned::new(&varied));
+        assert_ne!(
+            hash(AttrsOwned::new(&defaults)),
+            hash(AttrsOwned::new(&varied))
+        );
+        assert_eq!(AttrsOwned::new(&varied).as_attrs(), varied);
+    }
+
+    #[test]
+    fn setting_an_axis_twice_replaces_its_coordinate() {
+        let mut variations = FontVariations::new();
+        variations
+            .set(VariationTag::new(b"opsz"), 14.0)
+            .set(VariationTag::new(b"opsz"), 32.0);
+
+        assert_eq!(variations.len(), 1);
+        assert_eq!(
+            variations.iter().next().map(|variation| variation.value.0),
+            Some(32.0)
+        );
+    }
+
+    #[test]
+    fn variation_order_does_not_change_shape_identity() {
+        let left = Attrs::new()
+            .font_variation(VariationTag::new(b"wght"), 500.0)
+            .font_variation(VariationTag::new(b"opsz"), 32.0);
+        let right = Attrs::new()
+            .font_variation(VariationTag::new(b"opsz"), 32.0)
+            .font_variation(VariationTag::new(b"wght"), 500.0);
+
+        assert_eq!(left, right);
+        assert!(left.compatible(&right));
+        assert_eq!(hash(AttrsOwned::new(&left)), hash(AttrsOwned::new(&right)));
     }
 }

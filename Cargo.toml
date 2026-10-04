@@ -82,3 +82,7 @@ opt-level = 1
 
 [package.metadata.docs.rs]
 features = ["vi"]
+
+[[bench]]
+name = "variable_font_instances"
+harness = false

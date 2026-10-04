@@ -116,9 +116,33 @@ fn shape_fallback(
 ) -> Vec<usize> {
     let run = &line[start_run..end_run];
 
-    let font_scale = font.rustybuzz().units_per_em() as f32;
-    let ascent = font.rustybuzz().ascender() as f32 / font_scale;
-    let descent = -font.rustybuzz().descender() as f32 / font_scale;
+    let attrs = attrs_list.get_span(start_run);
+    // A Font owns Rustybuzz's default face, which must remain immutable because
+    // it is shared by every span using that font. Clone only when a span
+    // requests non-default variation coordinates, then use the varied face for
+    // metrics, plan construction, and shaping so advances and glyph selection
+    // are derived from the same instance.
+    let varied_face = if attrs.font_variations.is_empty() {
+        None
+    } else {
+        let mut face = font.rustybuzz().clone();
+        for variation in attrs
+            .font_variations
+            .iter()
+            .filter(|variation| variation.value.0.is_finite())
+        {
+            let _ = face.set_variation(
+                rustybuzz::ttf_parser::Tag::from_bytes(variation.tag.as_bytes()),
+                variation.value.0,
+            );
+        }
+        Some(face)
+    };
+    let face = varied_face.as_ref().unwrap_or_else(|| font.rustybuzz());
+
+    let font_scale = face.units_per_em() as f32;
+    let ascent = face.ascender() as f32 / font_scale;
+    let descent = -face.descender() as f32 / font_scale;
 
     let mut buffer = scratch.rustybuzz_buffer.take().unwrap_or_default();
     buffer.set_direction(if span_rtl {
@@ -140,7 +164,6 @@ fn shape_fallback(
     let rtl = matches!(buffer.direction(), rustybuzz::Direction::RightToLeft);
     assert_eq!(rtl, span_rtl);
 
-    let attrs = attrs_list.get_span(start_run);
     let mut rb_font_features = Vec::new();
 
     // Convert attrs::Feature to rustybuzz::Feature
@@ -153,13 +176,13 @@ fn shape_fallback(
     }
 
     let shape_plan = rustybuzz::ShapePlan::new(
-        font.rustybuzz(),
+        face,
         buffer.direction(),
         Some(buffer.script()),
         buffer.language().as_ref(),
         &rb_font_features,
     );
-    let glyph_buffer = rustybuzz::shape_with_plan(font.rustybuzz(), &shape_plan, buffer);
+    let glyph_buffer = rustybuzz::shape_with_plan(face, &shape_plan, buffer);
     let glyph_infos = glyph_buffer.glyph_infos();
     let glyph_positions = glyph_buffer.glyph_positions();
 
@@ -261,18 +284,28 @@ fn shape_run(
 
     let attrs = attrs_list.get_span(start_run);
 
+    // A higher-level CSS matcher may already have selected an exact
+    // @font-face resource. Load it before constructing the ordinary family
+    // fallback iterator so sibling resources with identical internal
+    // metadata cannot replace it.
+    let selected_font = attrs
+        .font_id_opt
+        .and_then(|font_id| font_system.get_font(font_id));
     let fonts = font_system.get_font_matches(&attrs);
 
     let default_families = [&attrs.family];
     let mut font_iter = FontFallbackIter::new(
         font_system,
         &fonts,
+        attrs.font_id_opt,
         &default_families,
         &scripts,
         &line[start_run..end_run],
     );
 
-    let font = font_iter.next().expect("no default font found");
+    let font = selected_font
+        .or_else(|| font_iter.next())
+        .expect("no default font found");
 
     let glyph_start = glyphs.len();
     let mut missing = {
@@ -444,12 +477,24 @@ fn shape_skip(
     end_run: usize,
 ) {
     let attrs = attrs_list.get_span(start_run);
+    let selected_font = attrs
+        .font_id_opt
+        .and_then(|font_id| font_system.get_font(font_id));
     let fonts = font_system.get_font_matches(&attrs);
 
     let default_families = [&attrs.family];
-    let mut font_iter = FontFallbackIter::new(font_system, &fonts, &default_families, &[], "");
+    let mut font_iter = FontFallbackIter::new(
+        font_system,
+        &fonts,
+        attrs.font_id_opt,
+        &default_families,
+        &[],
+        "",
+    );
 
-    let font = font_iter.next().expect("no default font found");
+    let font = selected_font
+        .or_else(|| font_iter.next())
+        .expect("no default font found");
     let font_id = font.id();
     let font_monospace_em_width = font.monospace_em_width();
     let font = font.as_swash();

@@ -184,6 +184,7 @@ pub(crate) struct MonospaceFallbackInfo {
 pub struct FontFallbackIter<'a> {
     font_system: &'a mut FontSystem,
     font_match_keys: &'a [FontMatchKey],
+    skip_font_id: Option<fontdb::ID>,
     default_families: &'a [&'a Family<'a>],
     default_i: usize,
     scripts: &'a [Script],
@@ -198,6 +199,7 @@ impl<'a> FontFallbackIter<'a> {
     pub fn new(
         font_system: &'a mut FontSystem,
         font_match_keys: &'a [FontMatchKey],
+        skip_font_id: Option<fontdb::ID>,
         default_families: &'a [&'a Family<'a>],
         scripts: &'a [Script],
         word: &'a str,
@@ -209,6 +211,7 @@ impl<'a> FontFallbackIter<'a> {
         Self {
             font_system,
             font_match_keys,
+            skip_font_id,
             default_families,
             default_i: 0,
             scripts,
@@ -279,6 +282,7 @@ impl<'a> FontFallbackIter<'a> {
         self.font_match_keys
             .iter()
             .filter(|m_key| m_key.font_weight_diff == 0)
+            .filter(|m_key| Some(m_key.id) != self.skip_font_id)
             .find(|m_key| self.face_contains_family(m_key.id, default_family_name))
     }
 
@@ -293,6 +297,7 @@ impl<'a> FontFallbackIter<'a> {
             self.font_match_keys
                 .iter()
                 .filter(move |m_key| m_key.font_weight_diff == 0 || is_mono)
+                .filter(|m_key| Some(m_key.id) != self.skip_font_id)
         };
 
         'DEF_FAM: while self.default_i < self.default_families.len() {
@@ -446,6 +451,9 @@ impl<'a> FontFallbackIter<'a> {
         while self.other_i < self.font_match_keys.len() {
             let id = self.font_match_keys[self.other_i].id;
             self.other_i += 1;
+            if Some(id) == self.skip_font_id {
+                continue;
+            }
             if forbidden_families
                 .iter()
                 .all(|family_name| !self.face_contains_family(id, family_name))
