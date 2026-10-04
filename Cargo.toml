@@ -84,6 +84,10 @@ opt-level = 1
 features = ["vi"]
 
 [[bench]]
+name = "css_line_breaking"
+harness = false
+
+[[bench]]
 name = "fallback_font_variations"
 harness = false
 
