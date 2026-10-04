@@ -84,5 +84,9 @@ opt-level = 1
 features = ["vi"]
 
 [[bench]]
+name = "fallback_font_variations"
+harness = false
+
+[[bench]]
 name = "variable_font_instances"
 harness = false
