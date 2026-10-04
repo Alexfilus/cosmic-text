@@ -1,0 +1,1115 @@
+diff --git b/src/attrs.rs a/src/attrs.rs
+index f74610b..3b0ea46 100644
+--- b/src/attrs.rs
++++ a/src/attrs.rs
+@@ -7 +6,0 @@ use core::ops::Range;
+-use core::sync::atomic::{AtomicU64, Ordering};
+@@ -632,58 +630,0 @@ impl AttrsOwned {
+-
+-    /// Same result as [`Attrs::compatible`] on the borrowed forms.
+-    pub(crate) fn compatible(&self, other: &Self) -> bool {
+-        self.family_owned == other.family_owned
+-            && self.font_id_opt == other.font_id_opt
+-            && self.font_weight_axis_opt == other.font_weight_axis_opt
+-            && self.font_optical_size_opt == other.font_optical_size_opt
+-            && self.font_italic_axis == other.font_italic_axis
+-            && self.stretch == other.stretch
+-            && self.style == other.style
+-            && self.weight == other.weight
+-            && self.font_variations == other.font_variations
+-    }
+-}
+-
+-/// Forward lookup of span attributes that reuses the last span found while
+-/// the queried index stays inside it.
+-pub(crate) struct SpanCursor<'a> {
+-    list: &'a AttrsList,
+-    attrs: &'a AttrsOwned,
+-    start: usize,
+-    end: usize,
+-}
+-
+-impl<'a> SpanCursor<'a> {
+-    pub(crate) fn new(list: &'a AttrsList) -> Self {
+-        Self {
+-            list,
+-            attrs: &list.defaults,
+-            start: 0,
+-            end: 0,
+-        }
+-    }
+-
+-    /// Same attributes as [`AttrsList::get_span`] for `index`.
+-    pub(crate) fn get(&mut self, index: usize) -> &'a AttrsOwned {
+-        if index < self.start || index >= self.end {
+-            let (attrs, end) = match self.list.spans.overlapping(index..usize::MAX).next() {
+-                Some((range, attrs)) if range.start <= index => (attrs, range.end),
+-                Some((range, _)) => (&self.list.defaults, range.start),
+-                None => (&self.list.defaults, usize::MAX),
+-            };
+-            self.attrs = attrs;
+-            self.start = index;
+-            self.end = end;
+-        }
+-        self.attrs
+-    }
+-
+-    /// End of the index range that shares the attributes last returned.
+-    pub(crate) fn valid_until(&self) -> usize {
+-        self.end
+-    }
+-}
+-
+-fn next_attrs_list_version() -> u64 {
+-    static NEXT: AtomicU64 = AtomicU64::new(0);
+-    NEXT.fetch_add(1, Ordering::Relaxed)
+@@ -694 +635 @@ fn next_attrs_list_version() -> u64 {
+-#[derive(Debug, Clone)]
++#[derive(Debug, Clone, Eq, PartialEq)]
+@@ -698,9 +638,0 @@ pub struct AttrsList {
+-    /// Process-unique id of these contents, replaced on every change and
+-    /// shared by clones. Keys the shape-run cache's per-list memo.
+-    version: u64,
+-}
+-
+-impl PartialEq for AttrsList {
+-    fn eq(&self, other: &Self) -> bool {
+-        self.defaults == other.defaults && self.spans == other.spans
+-    }
+@@ -709,2 +640,0 @@ impl PartialEq for AttrsList {
+-impl Eq for AttrsList {}
+-
+@@ -717 +646,0 @@ impl AttrsList {
+-            version: next_attrs_list_version(),
+@@ -721,4 +649,0 @@ impl AttrsList {
+-    pub(crate) fn version(&self) -> u64 {
+-        self.version
+-    }
+-
+@@ -730,4 +654,0 @@ impl AttrsList {
+-    pub(crate) fn defaults_owned(&self) -> &AttrsOwned {
+-        &self.defaults
+-    }
+-
+@@ -747 +667,0 @@ impl AttrsList {
+-        self.version = next_attrs_list_version();
+@@ -758 +677,0 @@ impl AttrsList {
+-        self.version = next_attrs_list_version();
+@@ -767,2 +686,2 @@ impl AttrsList {
+-            .unwrap_or(&self.defaults)
+-            .as_attrs()
++            .map(|v| v.as_attrs())
++            .unwrap_or(self.defaults.as_attrs())
+@@ -771,0 +691 @@ impl AttrsList {
++    #[allow(clippy::missing_panics_doc)]
+@@ -773,11 +693,12 @@ impl AttrsList {
+-        let mut new = Self {
+-            defaults: self.defaults.clone(),
+-            spans: RangeMap::new(),
+-            version: next_attrs_list_version(),
+-        };
+-        if self
+-            .spans
+-            .last_range_value()
+-            .map_or(true, |(range, _)| range.end <= index)
+-        {
+-            return new;
++        let mut new = Self::new(&self.defaults.as_attrs());
++        let mut removes = Vec::new();
++
++        //get the keys we need to remove or fix.
++        for span in self.spans.iter() {
++            if span.0.end <= index {
++                continue;
++            } else if span.0.start >= index {
++                removes.push((span.0.clone(), false));
++            } else {
++                removes.push((span.0.clone(), true));
++            }
+@@ -785,8 +706,12 @@ impl AttrsList {
+-        // Rebuilding the head is cheaper than removing the tail span by span.
+-        let mut head = RangeMap::new();
+-        for (range, attrs) in core::mem::take(&mut self.spans) {
+-            if range.end <= index {
+-                head.insert(range, attrs);
+-            } else if range.start < index {
+-                head.insert(range.start..index, attrs.clone());
+-                new.spans.insert(0..range.end - index, attrs);
++
++        for (key, resize) in removes {
++            let (range, attrs) = self
++                .spans
++                .get_key_value(&key.start)
++                .map(|v| (v.0.clone(), v.1.clone()))
++                .expect("attrs span not found");
++            self.spans.remove(key);
++
++            if resize {
++                new.spans.insert(0..range.end - index, attrs.clone());
++                self.spans.insert(range.start..index, attrs);
+@@ -794 +719,2 @@ impl AttrsList {
+-                new.spans.insert(range.start - index..range.end - index, attrs);
++                new.spans
++                    .insert(range.start - index..range.end - index, attrs);
+@@ -797,2 +722,0 @@ impl AttrsList {
+-        self.spans = head;
+-        self.version = next_attrs_list_version();
+@@ -806 +729,0 @@ impl AttrsList {
+-        self.version = next_attrs_list_version();
+@@ -813 +736 @@ mod tests {
+-    use super::{Attrs, AttrsList, AttrsOwned, Color, FontVariations, SpanCursor, VariationTag};
++    use super::{Attrs, AttrsOwned, FontVariations, VariationTag};
+@@ -817,40 +739,0 @@ mod tests {
+-    fn sample_list() -> AttrsList {
+-        let mut list = AttrsList::new(&Attrs::new());
+-        list.add_span(2..5, &Attrs::new().color(Color(1)));
+-        list.add_span(5..9, &Attrs::new().color(Color(2)));
+-        list.add_span(12..20, &Attrs::new().color(Color(1)));
+-        list
+-    }
+-
+-    #[test]
+-    fn span_cursor_matches_get_span() {
+-        let list = sample_list();
+-        let mut cursor = SpanCursor::new(&list);
+-        for index in (0..24).chain((0..24).rev()).chain([7, 3, 15, 0, 22]) {
+-            assert_eq!(cursor.get(index).as_attrs(), list.get_span(index), "{index}");
+-            assert!(cursor.valid_until() > index);
+-        }
+-    }
+-
+-    #[test]
+-    fn split_off_keeps_every_index_and_changes_versions() {
+-        for index in 0..24 {
+-            let mut head = sample_list();
+-            let version = head.version();
+-            let tail = head.split_off(index);
+-            let whole = sample_list();
+-            for i in 0..24 {
+-                let expected = whole.get_span(i);
+-                if i < index {
+-                    assert_eq!(head.get_span(i), expected, "{index} {i}");
+-                } else {
+-                    assert_eq!(tail.get_span(i - index), expected, "{index} {i}");
+-                }
+-            }
+-            assert!(head.spans_iter().all(|(range, _)| range.end <= index));
+-            assert_ne!(tail.version(), version);
+-            let changed = whole.spans_iter().any(|(range, _)| range.end > index);
+-            assert_eq!(head.version() != version, changed, "{index}");
+-        }
+-    }
+-
+diff --git b/src/buffer_line.rs a/src/buffer_line.rs
+index bd1e0c0..6929e03 100644
+--- b/src/buffer_line.rs
++++ a/src/buffer_line.rs
+@@ -185,4 +184,0 @@ impl BufferLine {
+-        // Both halves must reshape. The tail is usually the longer one, so it
+-        // takes the unused shape and layout allocations.
+-        mem::swap(&mut new.shape_opt, &mut self.shape_opt);
+-        mem::swap(&mut new.layout_opt, &mut self.layout_opt);
+diff --git b/src/shape.rs a/src/shape.rs
+index d8fbeae..7a0d037 100644
+--- b/src/shape.rs
++++ a/src/shape.rs
+@@ -16 +15,0 @@ use crate::fallback::FontFallbackIter;
+-use crate::attrs::SpanCursor;
+@@ -122,15 +121,20 @@ impl fmt::Debug for ShapeBuffer {
+-/// True when `unicode_bidi::BidiInfo` would see at most one paragraph whose
+-/// levels are all zero: no paragraph separator, no strong RTL or Arabic
+-/// number, and no embedding, override or isolate initiator.
+-fn is_pure_ltr(line: &str) -> bool {
+-    use unicode_bidi::BidiClass::{AL, AN, B, FSI, LRE, LRI, LRO, R, RLE, RLI, RLO};
+-    line.chars().all(|c| {
+-        if (c as u32) < 0x0590 {
+-            !matches!(c, '\n' | '\r' | '\u{1c}'..='\u{1e}' | '\u{85}')
+-        } else {
+-            !matches!(
+-                unicode_bidi::bidi_class(c),
+-                AL | AN | B | FSI | LRE | LRI | LRO | R | RLE | RLI | RLO
+-            )
+-        }
+-    })
++#[inline]
++fn is_cursive_script(script: Script) -> bool {
++    matches!(
++        script,
++        Script::Arabic
++            | Script::Hanifi_Rohingya
++            | Script::Mandaic
++            | Script::Mongolian
++            | Script::Nko
++            | Script::Phags_Pa
++            | Script::Syriac
++    )
++}
++
++#[inline]
++fn cluster_allows_letter_spacing(line: &str, cluster_start: usize) -> bool {
++    line[cluster_start..]
++        .chars()
++        .next()
++        .map_or(true, |base| !is_cursive_script(base.script()))
+@@ -275,2 +279 @@ fn shape_fallback(
+-    let mut spans = SpanCursor::new(attrs_list);
+-    for (info, pos) in glyph_infos.iter().zip(glyph_positions.iter()) {
++    for (glyph_index, (info, pos)) in glyph_infos.iter().zip(glyph_positions.iter()).enumerate() {
+@@ -283,3 +286,23 @@ fn shape_fallback(
+-        let attrs = spans.get(start_glyph);
+-        let x_advance = pos.x_advance as f32 / font_scale
+-            + attrs.letter_spacing_opt.map_or(0.0, |spacing| spacing.0);
++        let attrs = attrs_list.get_span(start_glyph);
++        // Rustybuzz can emit several glyphs for one character cluster (for
++        // example a base plus combining marks). Apply tracking once, after the
++        // final glyph in Rustybuzz's cluster order, instead of once per glyph.
++        //
++        // ShapeSpan reverses every word's glyphs for an overall RTL line. The
++        // final glyph here therefore becomes the first stored glyph there,
++        // which puts the added advance on the physical right of both LTR and
++        // RTL clusters without separating a base from its marks.
++        let letter_spacing = match attrs.letter_spacing_opt {
++            Some(spacing) if spacing.0 != 0.0 => {
++                let cluster_end = glyph_infos
++                    .get(glyph_index + 1)
++                    .map_or(true, |next| next.cluster != info.cluster);
++                if cluster_end && cluster_allows_letter_spacing(line, start_glyph) {
++                    spacing.0
++                } else {
++                    0.0
++                }
++            }
++            _ => 0.0,
++        };
++        let x_advance = pos.x_advance as f32 / font_scale + letter_spacing;
+@@ -508 +531 @@ fn shape_run_cached(
+-    use crate::ShapeRunKey;
++    use crate::{AttrsOwned, ShapeRunKey};
+@@ -511,17 +534,4 @@ fn shape_run_cached(
+-    let text = &line[run_range.clone()];
+-    let run_cache = &mut font_system.shape_run_cache;
+-    let default_attrs = run_cache.default_attrs_id(attrs_list);
+-    // Reuse the previous lookup key's allocations; only a miss keeps the key.
+-    let mut key = match run_cache.scratch_key.take() {
+-        Some(mut key) => {
+-            key.text.clear();
+-            key.text.push_str(text);
+-            key.default_attrs = default_attrs;
+-            key.attrs_spans.clear();
+-            key
+-        }
+-        None => ShapeRunKey {
+-            text: text.to_string(),
+-            default_attrs,
+-            attrs_spans: Vec::new(),
+-        },
++    let mut key = ShapeRunKey {
++        text: line[run_range.clone()].to_string(),
++        default_attrs: AttrsOwned::new(&attrs_list.defaults()),
++        attrs_spans: Vec::new(),
+@@ -530,2 +540 @@ fn shape_run_cached(
+-        let attrs = run_cache.span_attrs_id(attrs_range.start, attrs);
+-        if attrs == default_attrs {
++        if attrs == &key.default_attrs {
+@@ -539 +548 @@ fn shape_run_cached(
+-            key.attrs_spans.push((range, attrs));
++            key.attrs_spans.push((range, attrs.clone()));
+@@ -543 +552 @@ fn shape_run_cached(
+-        glyphs.extend(cache_glyphs.iter().map(|glyph| {
++        for mut glyph in cache_glyphs.iter().cloned() {
+@@ -545 +553,0 @@ fn shape_run_cached(
+-            let mut glyph = glyph.clone();
+@@ -548,3 +556,2 @@ fn shape_run_cached(
+-            glyph
+-        }));
+-        font_system.shape_run_cache.scratch_key = Some(key);
++            glyphs.push(glyph);
++        }
+@@ -744,18 +751,17 @@ impl ShapeWord {
+-    /// `offsets` must be sorted and free of duplicates.
+-    fn glyph_indices_for_offsets(glyphs: &[ShapeGlyph], offsets: &[usize], indices: &mut Vec<usize>) {
+-        indices.clear();
+-        if offsets.is_empty() {
+-            return;
+-        }
+-        indices.extend((1..glyphs.len()).filter(|&index| {
+-            let before = &glyphs[index - 1];
+-            let after = &glyphs[index];
+-            let offset = if before.end <= after.start {
+-                after.start
+-            } else if after.end <= before.start {
+-                before.start
+-            } else {
+-                return false;
+-            };
+-            offsets.binary_search(&offset).is_ok()
+-        }));
++    fn glyph_indices_for_offsets(&self, mut offsets: Vec<usize>) -> Vec<usize> {
++        offsets.sort_unstable();
++        offsets.dedup();
++        (1..self.glyphs.len())
++            .filter(|&index| {
++                let before = &self.glyphs[index - 1];
++                let after = &self.glyphs[index];
++                let offset = if before.end <= after.start {
++                    after.start
++                } else if after.end <= before.start {
++                    before.start
++                } else {
++                    return false;
++                };
++                offsets.binary_search(&offset).is_ok()
++            })
++            .collect()
+@@ -767,3 +773,3 @@ impl ShapeWord {
+-        soft_offsets: &[usize],
+-        emergency_offsets: &[usize],
+-        min_content_offsets: &[usize],
++        soft_offsets: impl Iterator<Item = usize>,
++        emergency_offsets: impl Iterator<Item = usize>,
++        min_content_offsets: impl Iterator<Item = usize>,
+@@ -771,11 +777,4 @@ impl ShapeWord {
+-        Self::glyph_indices_for_offsets(&self.glyphs, soft_offsets, &mut self.soft_breaks);
+-        Self::glyph_indices_for_offsets(
+-            &self.glyphs,
+-            emergency_offsets,
+-            &mut self.emergency_breaks,
+-        );
+-        Self::glyph_indices_for_offsets(
+-            &self.glyphs,
+-            min_content_offsets,
+-            &mut self.min_content_breaks,
+-        );
++        let soft_breaks = self.glyph_indices_for_offsets(soft_offsets.collect());
++        let emergency_breaks = self.glyph_indices_for_offsets(emergency_offsets.collect());
++        let min_content_breaks =
++            self.glyph_indices_for_offsets(min_content_offsets.collect());
+@@ -782,0 +782,3 @@ impl ShapeWord {
++        self.soft_breaks = soft_breaks;
++        self.emergency_breaks = emergency_breaks;
++        self.min_content_breaks = min_content_breaks;
+@@ -800,5 +802,3 @@ impl ShapeWord {
+-    /// Append the glyph indices where this word may break. They are all
+-    /// nonzero, so a caller's leading `0` stays first after sorting.
+-    fn push_break_indices(&self, wrap: Wrap, use_emergency: bool, breaks: &mut Vec<usize>) {
+-        if wrap == Wrap::Glyph || (!self.custom_line_breaks && use_emergency) {
+-            breaks.extend((1..self.glyphs.len()).filter(|&index| {
++    fn cluster_boundaries(&self) -> Vec<usize> {
++        (1..self.glyphs.len())
++            .filter(|&index| {
+@@ -808,2 +808,7 @@ impl ShapeWord {
+-            }));
+-            return;
++            })
++            .collect()
++    }
++
++    fn break_indices(&self, wrap: Wrap, use_emergency: bool) -> Vec<usize> {
++        if wrap == Wrap::Glyph || (!self.custom_line_breaks && use_emergency) {
++            return self.cluster_boundaries();
+@@ -811 +816 @@ impl ShapeWord {
+-        breaks.extend_from_slice(&self.soft_breaks);
++        let mut breaks = self.soft_breaks.clone();
+@@ -818 +823 @@ impl ShapeWord {
+-            breaks.extend_from_slice(emergency);
++            breaks.extend(emergency.iter().copied());
+@@ -821,0 +827 @@ impl ShapeWord {
++        breaks
+@@ -876,3 +882 @@ impl ShapeWord {
+-        let mut attrs = attrs_list.defaults_owned();
+-        let mut spans = SpanCursor::new(attrs_list);
+-        let mut checked = None;
++        let mut attrs = attrs_list.defaults();
+@@ -881,21 +885,11 @@ impl ShapeWord {
+-            let attrs_egc = spans.get(start_egc);
+-            // `attrs` is compatible with the attrs checked last, so only a
+-            // different span can end the run.
+-            if checked.is_some_and(|checked| core::ptr::eq(checked, attrs_egc)) {
+-                continue;
+-            }
+-            checked = Some(attrs_egc);
+-            let rest_in_span = spans.valid_until() >= word_range.end;
+-            if !attrs.compatible(attrs_egc) {
+-                // An empty run has no glyphs to shape.
+-                if start_run < start_egc {
+-                    shaping.run(
+-                        &mut glyphs,
+-                        font_system,
+-                        line,
+-                        attrs_list,
+-                        start_run,
+-                        start_egc,
+-                        span_rtl,
+-                    );
+-                }
++            let attrs_egc = attrs_list.get_span(start_egc);
++            if !attrs.compatible(&attrs_egc) {
++                shaping.run(
++                    &mut glyphs,
++                    font_system,
++                    line,
++                    attrs_list,
++                    start_run,
++                    start_egc,
++                    span_rtl,
++                );
+@@ -906,4 +899,0 @@ impl ShapeWord {
+-            if rest_in_span {
+-                // Every later grapheme maps to `checked`.
+-                break;
+-            }
+@@ -990 +980 @@ fn keep_all_word_class(class: BreakClass) -> bool {
+-fn break_all_class(grapheme: &str, class: BreakClass) -> BreakClass {
++fn break_all_class(grapheme: &str) -> BreakClass {
+@@ -995 +985 @@ fn break_all_class(grapheme: &str, class: BreakClass) -> BreakClass {
+-        class
++        grapheme_break_class(grapheme)
+@@ -1091,12 +1081,13 @@ fn css_break_data(span: &str, span_start: usize, attrs_list: &AttrsList) -> CssB
+-    let mut spans = SpanCursor::new(attrs_list);
+-    let mut graphemes = Vec::with_capacity(span.len());
+-    graphemes.extend(span.grapheme_indices(true).map(|(start, grapheme)| {
+-        let class = grapheme_break_class(grapheme);
+-        GraphemeBreakData {
+-            end: start + grapheme.len(),
+-            class,
+-            break_all_class: break_all_class(grapheme, class),
+-            vertical_line: grapheme == "|",
+-            policy: spans.get(span_start + start).css_line_break,
+-        }
+-    }));
++    let graphemes: Vec<GraphemeBreakData> = span
++        .grapheme_indices(true)
++        .map(|(start, grapheme)| {
++            let class = grapheme_break_class(grapheme);
++            GraphemeBreakData {
++                end: start + grapheme.len(),
++                class,
++                break_all_class: break_all_class(grapheme),
++                vertical_line: grapheme == "|",
++                policy: attrs_list.get_span(span_start + start).css_line_break,
++            }
++        })
++        .collect();
+@@ -1110,2 +1100,0 @@ fn css_break_data(span: &str, span_start: usize, attrs_list: &AttrsList) -> CssB
+-    // Both `normal_breaks` and the pair offsets increase strictly.
+-    let mut normal_breaks = normal_breaks.into_iter().peekable();
+@@ -1117,2 +1106 @@ fn css_break_data(span: &str, span_start: usize, attrs_list: &AttrsList) -> CssB
+-        while normal_breaks.next_if(|&normal| normal < offset).is_some() {}
+-        let normal_break = normal_breaks.peek() == Some(&offset);
++        let normal_break = normal_breaks.binary_search(&offset).is_ok();
+@@ -1221,2 +1208,0 @@ impl ShapeSpan {
+-        // Words left over from earlier spans stay below this span's words as
+-        // spare allocations for spans that grow, such as a freshly split line.
+@@ -1223,0 +1210 @@ impl ShapeSpan {
++        cached_words.clear();
+@@ -1232,2 +1218,0 @@ impl ShapeSpan {
+-        words.reserve(breaks.word_breaks.len());
+-        let mut spans = SpanCursor::new(attrs_list);
+@@ -1260,14 +1245,8 @@ impl ShapeSpan {
+-                // Whether any character starts where a CSS policy applies,
+-                // checking the first character of each attribute run.
+-                let mut custom = false;
+-                let mut offset = absolute.start;
+-                while offset < absolute.end {
+-                    if spans.get(offset).css_line_break.is_some() {
+-                        custom = true;
+-                        break;
+-                    }
+-                    offset = spans.valid_until();
+-                    while offset < absolute.end && !line.is_char_boundary(offset) {
+-                        offset += 1;
+-                    }
+-                }
++                let custom = line[absolute.clone()]
++                    .char_indices()
++                    .any(|(offset, _)| {
++                        attrs_list
++                            .get_span(absolute.start + offset)
++                            .css_line_break
++                            .is_some()
++                    });
+@@ -1294,3 +1273,7 @@ impl ShapeSpan {
+-                    &breaks.soft_breaks[soft_start..soft_end],
+-                    &breaks.emergency_breaks[emergency_start..emergency_end],
+-                    &breaks.min_content_breaks[min_start..min_end],
++                    breaks.soft_breaks[soft_start..soft_end].iter().copied(),
++                    breaks.emergency_breaks[emergency_start..emergency_end]
++                        .iter()
++                        .copied(),
++                    breaks.min_content_breaks[min_start..min_end]
++                        .iter()
++                        .copied(),
+@@ -1316,2 +1299,10 @@ impl ShapeSpan {
+-                    let custom = spans.get(absolute.start).css_line_break.is_some();
+-                    word.set_line_breaks(custom, &[], &[], &[]);
++                    let custom = attrs_list
++                        .get_span(absolute.start)
++                        .css_line_break
++                        .is_some();
++                    word.set_line_breaks(
++                        custom,
++                        core::iter::empty(),
++                        core::iter::empty(),
++                        core::iter::empty(),
++                    );
+@@ -1422,15 +1413,2 @@ impl ShapeLine {
+-        let rtl = if is_pure_ltr(line) {
+-            log::trace!("Line LTR: '{}'", line);
+-            if !line.is_empty() {
+-                let mut span = cached_spans.pop().unwrap_or_else(ShapeSpan::empty);
+-                span.build(
+-                    font_system,
+-                    line,
+-                    attrs_list,
+-                    0..line.len(),
+-                    false,
+-                    unicode_bidi::Level::ltr(),
+-                    shaping,
+-                );
+-                spans.push(span);
+-            }
++        let bidi = unicode_bidi::BidiInfo::new(line, None);
++        let rtl = if bidi.paragraphs.is_empty() {
+@@ -1439,6 +1417,2 @@ impl ShapeLine {
+-            let bidi = unicode_bidi::BidiInfo::new(line, None);
+-            let rtl = if bidi.paragraphs.is_empty() {
+-                false
+-            } else {
+-                bidi.paragraphs[0].level.is_rtl()
+-            };
++            bidi.paragraphs[0].level.is_rtl()
++        };
+@@ -1446 +1420 @@ impl ShapeLine {
+-            log::trace!("Line {}: '{}'", if rtl { "RTL" } else { "LTR" }, line);
++        log::trace!("Line {}: '{}'", if rtl { "RTL" } else { "LTR" }, line);
+@@ -1448,3 +1422,3 @@ impl ShapeLine {
+-            for para_info in bidi.paragraphs.iter() {
+-                let line_rtl = para_info.level.is_rtl();
+-                assert_eq!(line_rtl, rtl);
++        for para_info in bidi.paragraphs.iter() {
++            let line_rtl = para_info.level.is_rtl();
++            assert_eq!(line_rtl, rtl);
+@@ -1452,2 +1426,2 @@ impl ShapeLine {
+-                let line_range = para_info.range.clone();
+-                let levels = Self::adjust_levels(&unicode_bidi::Paragraph::new(&bidi, para_info));
++            let line_range = para_info.range.clone();
++            let levels = Self::adjust_levels(&unicode_bidi::Paragraph::new(&bidi, para_info));
+@@ -1455,5 +1429,5 @@ impl ShapeLine {
+-                // Find consecutive level runs. We use this to create Spans.
+-                // Each span is a set of characters with equal levels.
+-                let mut start = line_range.start;
+-                let mut run_level = levels[start];
+-                spans.reserve(line_range.end - start + 1);
++            // Find consecutive level runs. We use this to create Spans.
++            // Each span is a set of characters with equal levels.
++            let mut start = line_range.start;
++            let mut run_level = levels[start];
++            spans.reserve(line_range.end - start + 1);
+@@ -1461,22 +1435,21 @@ impl ShapeLine {
+-                for (i, &new_level) in levels
+-                    .iter()
+-                    .enumerate()
+-                    .take(line_range.end)
+-                    .skip(start + 1)
+-                {
+-                    if new_level != run_level {
+-                        // End of the previous run, start of a new one.
+-                        let mut span = cached_spans.pop().unwrap_or_else(ShapeSpan::empty);
+-                        span.build(
+-                            font_system,
+-                            line,
+-                            attrs_list,
+-                            start..i,
+-                            line_rtl,
+-                            run_level,
+-                            shaping,
+-                        );
+-                        spans.push(span);
+-                        start = i;
+-                        run_level = new_level;
+-                    }
++            for (i, &new_level) in levels
++                .iter()
++                .enumerate()
++                .take(line_range.end)
++                .skip(start + 1)
++            {
++                if new_level != run_level {
++                    // End of the previous run, start of a new one.
++                    let mut span = cached_spans.pop().unwrap_or_else(ShapeSpan::empty);
++                    span.build(
++                        font_system,
++                        line,
++                        attrs_list,
++                        start..i,
++                        line_rtl,
++                        run_level,
++                        shaping,
++                    );
++                    spans.push(span);
++                    start = i;
++                    run_level = new_level;
+@@ -1484,11 +1456,0 @@ impl ShapeLine {
+-                let mut span = cached_spans.pop().unwrap_or_else(ShapeSpan::empty);
+-                span.build(
+-                    font_system,
+-                    line,
+-                    attrs_list,
+-                    start..line_range.end,
+-                    line_rtl,
+-                    run_level,
+-                    shaping,
+-                );
+-                spans.push(span);
+@@ -1496,2 +1458,12 @@ impl ShapeLine {
+-            rtl
+-        };
++            let mut span = cached_spans.pop().unwrap_or_else(ShapeSpan::empty);
++            span.build(
++                font_system,
++                line,
++                attrs_list,
++                start..line_range.end,
++                line_rtl,
++                run_level,
++                shaping,
++            );
++            spans.push(span);
++        }
+@@ -1500,12 +1472,9 @@ impl ShapeLine {
+-        if line.contains('\t') {
+-            let mut x = 0.0;
+-            for span in spans.iter_mut() {
+-                for word in span.words.iter_mut() {
+-                    for glyph in word.glyphs.iter_mut() {
+-                        if line.get(glyph.start..glyph.end) == Some("\t") {
+-                            // Tabs are shaped as spaces, so they will always have the x_advance of a space.
+-                            let tab_x_advance = (tab_width as f32) * glyph.x_advance;
+-                            let tab_stop = (math::floorf(x / tab_x_advance) + 1.0) * tab_x_advance;
+-                            glyph.x_advance = tab_stop - x;
+-                        }
+-                        x += glyph.x_advance;
++        let mut x = 0.0;
++        for span in spans.iter_mut() {
++            for word in span.words.iter_mut() {
++                for glyph in word.glyphs.iter_mut() {
++                    if line.get(glyph.start..glyph.end) == Some("\t") {
++                        // Tabs are shaped as spaces, so they will always have the x_advance of a space.
++                        let tab_x_advance = (tab_width as f32) * glyph.x_advance;
++                        let tab_stop = (math::floorf(x / tab_x_advance) + 1.0) * tab_x_advance;
++                        glyph.x_advance = tab_stop - x;
+@@ -1512,0 +1482 @@ impl ShapeLine {
++                    x += glyph.x_advance;
+@@ -1519 +1489 @@ impl ShapeLine {
+-        self.metrics_opt = attrs_list.defaults_owned().metrics_opt.map(|x| x.into());
++        self.metrics_opt = attrs_list.defaults().metrics_opt.map(|x| x.into());
+@@ -1676,2 +1645,0 @@ impl ShapeLine {
+-        // `visual_lines` is empty between calls; `cached_visual_lines` is a
+-        // pool of uncleared lines, cleared when taken.
+@@ -1680,5 +1648,5 @@ impl ShapeLine {
+-        fn take_visual_line(pool: &mut Vec<VisualLine>) -> VisualLine {
+-            let mut line = pool.pop().unwrap_or_default();
+-            line.clear();
+-            line
+-        }
++        cached_visual_lines.clear();
++        cached_visual_lines.extend(visual_lines.drain(..).map(|mut l| {
++            l.clear();
++            l
++        }));
+@@ -1687 +1654,0 @@ impl ShapeLine {
+-        // Glyph sets left over from earlier lines are kept as spare allocations.
+@@ -1688,0 +1656 @@ impl ShapeLine {
++        cached_glyph_sets.clear();
+@@ -1715,3 +1683 @@ impl ShapeLine {
+-        let mut current_visual_line = take_visual_line(&mut cached_visual_lines);
+-        // Word break positions, with a leading 0, for the word being wrapped.
+-        let mut boundaries = Vec::new();
++        let mut current_visual_line = cached_visual_lines.pop().unwrap_or_default();
+@@ -1775,4 +1741,2 @@ impl ShapeLine {
+-                            boundaries.clear();
+-                            boundaries.push(0);
+-                            word.push_break_indices(wrap, emergency, &mut boundaries);
+-                            if boundaries.len() > 1 {
++                            let break_indices = word.break_indices(wrap, emergency);
++                            if !break_indices.is_empty() {
+@@ -1798 +1762 @@ impl ShapeLine {
+-                                current_visual_line = take_visual_line(&mut cached_visual_lines);
++                                current_visual_line = cached_visual_lines.pop().unwrap_or_default();
+@@ -1805,0 +1770,3 @@ impl ShapeLine {
++                            let mut boundaries = Vec::with_capacity(break_indices.len() + 2);
++                            boundaries.push(0);
++                            boundaries.extend(break_indices);
+@@ -1832 +1799 @@ impl ShapeLine {
+-                                        take_visual_line(&mut cached_visual_lines);
++                                        cached_visual_lines.pop().unwrap_or_default();
+@@ -1873 +1840 @@ impl ShapeLine {
+-                                current_visual_line = take_visual_line(&mut cached_visual_lines);
++                                current_visual_line = cached_visual_lines.pop().unwrap_or_default();
+@@ -1920,4 +1887,2 @@ impl ShapeLine {
+-                            boundaries.clear();
+-                            boundaries.push(0);
+-                            word.push_break_indices(wrap, emergency, &mut boundaries);
+-                            if boundaries.len() > 1 {
++                            let break_indices = word.break_indices(wrap, emergency);
++                            if !break_indices.is_empty() {
+@@ -1943 +1908 @@ impl ShapeLine {
+-                                current_visual_line = take_visual_line(&mut cached_visual_lines);
++                                current_visual_line = cached_visual_lines.pop().unwrap_or_default();
+@@ -1950,0 +1916,3 @@ impl ShapeLine {
++                            let mut boundaries = Vec::with_capacity(break_indices.len() + 2);
++                            boundaries.push(0);
++                            boundaries.extend(break_indices);
+@@ -1977 +1945 @@ impl ShapeLine {
+-                                        take_visual_line(&mut cached_visual_lines);
++                                        cached_visual_lines.pop().unwrap_or_default();
+@@ -2015 +1983 @@ impl ShapeLine {
+-                                current_visual_line = take_visual_line(&mut cached_visual_lines);
++                                current_visual_line = cached_visual_lines.pop().unwrap_or_default();
+@@ -2071 +2038,0 @@ impl ShapeLine {
+-        layout_lines.reserve(number_of_visual_lines);
+@@ -2075,0 +2043 @@ impl ShapeLine {
++            let new_order = self.reorder(&visual_line.ranges);
+@@ -2079,20 +2046,0 @@ impl ShapeLine {
+-            glyphs.reserve(
+-                visual_line
+-                    .ranges
+-                    .iter()
+-                    .map(|&(span_index, (starting_word, starting_glyph), (ending_word, ending_glyph))| {
+-                        let words = &self.spans[span_index].words;
+-                        (starting_word..ending_word + usize::from(ending_glyph != 0))
+-                            .map(|i| {
+-                                let end = if i == ending_word {
+-                                    ending_glyph
+-                                } else {
+-                                    words[i].glyphs.len()
+-                                };
+-                                let start = if i == starting_word { starting_glyph } else { 0 };
+-                                end.saturating_sub(start)
+-                            })
+-                            .sum::<usize>()
+-                    })
+-                    .sum(),
+-            );
+@@ -2212,10 +2160,2 @@ impl ShapeLine {
+-            let first_level = self.spans[visual_line.ranges[0].0].level;
+-            if visual_line
+-                .ranges
+-                .iter()
+-                .all(|&(span_index, _, _)| self.spans[span_index].level == first_level)
+-            {
+-                // A single level run needs no reordering.
+-                process_range(0..visual_line.ranges.len());
+-            } else if self.rtl {
+-                for range in self.reorder(&visual_line.ranges).into_iter().rev() {
++            if self.rtl {
++                for range in new_order.into_iter().rev() {
+@@ -2226 +2166 @@ impl ShapeLine {
+-                for range in self.reorder(&visual_line.ranges) {
++                for range in new_order {
+@@ -2268 +2207,0 @@ impl ShapeLine {
+-        cached_visual_lines.append(&mut visual_lines);
+@@ -2269,0 +2209 @@ impl ShapeLine {
++        scratch.visual_lines.append(&mut cached_visual_lines);
+@@ -2276,3 +2216,60 @@ impl ShapeLine {
+-mod pure_ltr_tests {
+-    use super::is_pure_ltr;
+-    use unicode_bidi::{bidi_class, BidiClass::*, BidiInfo, Level};
++mod letter_spacing_tests {
++    use super::*;
++    use crate::{fontdb, Attrs, Family};
++
++    const TRACKING_EM: f32 = 0.125;
++    const EPSILON: f32 = 0.000_01;
++
++    fn font_system() -> FontSystem {
++        let mut db = fontdb::Database::new();
++        db.load_font_data(include_bytes!("../fonts/NotoSans-Regular.ttf").to_vec());
++        db.load_font_data(include_bytes!("../fonts/NotoSansHebrew.ttf").to_vec());
++        db.load_font_data(include_bytes!("../fonts/NotoSansArabic.ttf").to_vec());
++        FontSystem::new_with_locale_and_db("en-US".into(), db)
++    }
++
++    fn shape(text: &str, family: &'static str, spacing: Option<f32>) -> ShapeLine {
++        let mut font_system = font_system();
++        let mut attrs = Attrs::new().family(Family::Name(family));
++        if let Some(spacing) = spacing {
++            attrs = attrs.letter_spacing(spacing);
++        }
++        ShapeLine::new(
++            &mut font_system,
++            text,
++            &AttrsList::new(&attrs),
++            Shaping::Advanced,
++            8,
++        )
++    }
++
++    fn glyphs(line: &ShapeLine) -> Vec<&ShapeGlyph> {
++        line.spans
++            .iter()
++            .flat_map(|span| span.words.iter())
++            .flat_map(|word| word.glyphs.iter())
++            .collect()
++    }
++
++    fn assert_close(actual: f32, expected: f32) {
++        assert!(
++            (actual - expected).abs() <= EPSILON,
++            "expected {expected}, got {actual}"
++        );
++    }
++
++    fn assert_same_shaping(left: &ShapeLine, right: &ShapeLine) {
++        let left = glyphs(left);
++        let right = glyphs(right);
++        assert_eq!(left.len(), right.len());
++        for (left, right) in left.into_iter().zip(right) {
++            assert_eq!(
++                (left.start, left.end, left.font_id, left.glyph_id),
++                (right.start, right.end, right.font_id, right.glyph_id)
++            );
++            assert_eq!(left.x_advance.to_bits(), right.x_advance.to_bits());
++            assert_eq!(left.y_advance.to_bits(), right.y_advance.to_bits());
++            assert_eq!(left.x_offset.to_bits(), right.x_offset.to_bits());
++            assert_eq!(left.y_offset.to_bits(), right.y_offset.to_bits());
++        }
++    }
+@@ -2281,10 +2278,72 @@ mod pure_ltr_tests {
+-    fn pure_ltr_lines_have_one_ltr_paragraph() {
+-        for c in (0..0x3_0000u32).filter_map(char::from_u32) {
+-            let text = format!("a{c}b");
+-            let pure = is_pure_ltr(&text);
+-            if pure {
+-                let bidi = BidiInfo::new(&text, None);
+-                assert_eq!(bidi.paragraphs.len(), 1, "{c:?}");
+-                assert_eq!(bidi.paragraphs[0].range, 0..text.len(), "{c:?}");
+-                assert_eq!(bidi.paragraphs[0].level, Level::ltr(), "{c:?}");
+-                assert!(bidi.levels.iter().all(|level| *level == Level::ltr()), "{c:?}");
++    fn default_and_explicit_zero_have_identical_shaping() {
++        let default = shape("office x\u{301}\u{323}", "Noto Sans", None);
++        let zero = shape("office x\u{301}\u{323}", "Noto Sans", Some(0.0));
++        assert_same_shaping(&default, &zero);
++    }
++
++    #[test]
++    fn decomposed_marks_receive_one_advance_per_rustybuzz_cluster() {
++        let default = shape("x\u{301}\u{323}y", "Noto Sans", None);
++        let tracked = shape("x\u{301}\u{323}y", "Noto Sans", Some(TRACKING_EM));
++        assert!(!default.rtl);
++
++        let default_glyphs = glyphs(&default);
++        let tracked_glyphs = glyphs(&tracked);
++        assert_eq!(default_glyphs.len(), tracked_glyphs.len());
++
++        let mut cluster_count = 0;
++        let mut found_multi_glyph_cluster = false;
++        let mut start = 0;
++        while start < default_glyphs.len() {
++            let cluster = default_glyphs[start].start;
++            let mut end = start + 1;
++            while end < default_glyphs.len() && default_glyphs[end].start == cluster {
++                end += 1;
++            }
++            cluster_count += 1;
++            found_multi_glyph_cluster |= end - start > 1;
++
++            for index in start..end - 1 {
++                assert_close(
++                    tracked_glyphs[index].x_advance,
++                    default_glyphs[index].x_advance,
++                );
++            }
++            assert_close(
++                tracked_glyphs[end - 1].x_advance,
++                default_glyphs[end - 1].x_advance + TRACKING_EM,
++            );
++            start = end;
++        }
++
++        assert!(
++            found_multi_glyph_cluster,
++            "the test font must keep at least one decomposed mark as a separate glyph"
++        );
++        let default_width = default.layout(32.0, None, Wrap::None, None, None)[0].w;
++        let tracked_width = tracked.layout(32.0, None, Wrap::None, None, None)[0].w;
++        assert_close(
++            tracked_width - default_width,
++            cluster_count as f32 * TRACKING_EM * 32.0,
++        );
++    }
++
++    #[test]
++    fn rtl_cluster_spacing_survives_visual_order_reversal() {
++        let text = "ש\u{5b8}ב";
++        let default = shape(text, "Noto Sans Hebrew", None);
++        let tracked = shape(text, "Noto Sans Hebrew", Some(TRACKING_EM));
++        assert!(default.rtl);
++
++        let default_glyphs = glyphs(&default);
++        let tracked_glyphs = glyphs(&tracked);
++        assert_eq!(default_glyphs.len(), tracked_glyphs.len());
++
++        let mut cluster_count = 0;
++        let mut found_multi_glyph_cluster = false;
++        let mut start = 0;
++        while start < default_glyphs.len() {
++            let cluster = default_glyphs[start].start;
++            let mut end = start + 1;
++            while end < default_glyphs.len() && default_glyphs[end].start == cluster {
++                end += 1;
+@@ -2292,4 +2351,47 @@ mod pure_ltr_tests {
+-            if (c as u32) < 0x0590 {
+-                let excluded = matches!(
+-                    bidi_class(c),
+-                    AL | AN | B | FSI | LRE | LRI | LRO | R | RLE | RLI | RLO
++            cluster_count += 1;
++            found_multi_glyph_cluster |= end - start > 1;
++
++            assert_close(
++                tracked_glyphs[start].x_advance,
++                default_glyphs[start].x_advance + TRACKING_EM,
++            );
++            for index in start + 1..end {
++                assert_close(
++                    tracked_glyphs[index].x_advance,
++                    default_glyphs[index].x_advance,
++                );
++            }
++            start = end;
++        }
++
++        assert!(
++            found_multi_glyph_cluster,
++            "the test font must emit a separate Hebrew mark glyph"
++        );
++        let default_width = default.layout(32.0, None, Wrap::None, None, None)[0].w;
++        let tracked_width = tracked.layout(32.0, None, Wrap::None, None, None)[0].w;
++        assert_close(
++            tracked_width - default_width,
++            cluster_count as f32 * TRACKING_EM * 32.0,
++        );
++
++        // With RTL layout, x is decremented before each glyph is placed. The
++        // spacing-bearing glyph must therefore be first in stored visual
++        // order, so every glyph in a base+mark cluster moves together.
++        let default_layout = default.layout(32.0, Some(200.0), Wrap::None, None, None);
++        let tracked_layout = tracked.layout(32.0, Some(200.0), Wrap::None, None, None);
++        let default_layout = &default_layout[0].glyphs;
++        let tracked_layout = &tracked_layout[0].glyphs;
++        assert_eq!(default_layout.len(), tracked_layout.len());
++        let mut start = 0;
++        while start < default_layout.len() {
++            let cluster = default_layout[start].start;
++            let mut end = start + 1;
++            while end < default_layout.len() && default_layout[end].start == cluster {
++                end += 1;
++            }
++            let cluster_shift = tracked_layout[start].x - default_layout[start].x;
++            for index in start + 1..end {
++                assert_close(
++                    tracked_layout[index].x - default_layout[index].x,
++                    cluster_shift,
+@@ -2297 +2398,0 @@ mod pure_ltr_tests {
+-                assert_eq!(pure, !excluded, "{c:?}");
+@@ -2298,0 +2400 @@ mod pure_ltr_tests {
++            start = end;
+@@ -2300,3 +2402,32 @@ mod pure_ltr_tests {
+-        assert!(is_pure_ltr(""));
+-        assert!(!is_pure_ltr("abc \u{5d0}"));
+-        assert!(!is_pure_ltr("abc\ndef"));
++    }
++
++    #[test]
++    fn cursive_arabic_joins_are_preserved_but_space_is_tracked() {
++        let joined = "خالصة";
++        let default_joined = shape(joined, "Noto Sans Arabic", None);
++        let tracked_joined = shape(joined, "Noto Sans Arabic", Some(TRACKING_EM));
++        assert_same_shaping(&default_joined, &tracked_joined);
++
++        let text = "خالصة كلمة";
++        let space_start = text.find(' ').unwrap();
++        let default = shape(text, "Noto Sans Arabic", None);
++        let tracked = shape(text, "Noto Sans Arabic", Some(TRACKING_EM));
++        let default_glyphs = glyphs(&default);
++        let tracked_glyphs = glyphs(&tracked);
++        assert_eq!(default_glyphs.len(), tracked_glyphs.len());
++
++        let mut changed = 0;
++        for (default, tracked) in default_glyphs.into_iter().zip(tracked_glyphs) {
++            let delta = tracked.x_advance - default.x_advance;
++            if default.start == space_start {
++                assert_close(delta, TRACKING_EM);
++                changed += 1;
++            } else {
++                assert_close(delta, 0.0);
++            }
++        }
++        assert_eq!(changed, 1, "only the actual word separator is tracked");
++
++        let default_width = default.layout(32.0, None, Wrap::None, None, None)[0].w;
++        let tracked_width = tracked.layout(32.0, None, Wrap::None, None, None)[0].w;
++        assert_close(tracked_width - default_width, TRACKING_EM * 32.0);
+diff --git b/src/shape_run_cache.rs a/src/shape_run_cache.rs
+index 0e07c34..2e1ffc7 100644
+--- b/src/shape_run_cache.rs
++++ a/src/shape_run_cache.rs
+@@ -5 +5 @@ use core::ops::Range;
+-use crate::{AttrsList, AttrsOwned, HashMap, ShapeGlyph};
++use crate::{AttrsOwned, HashMap, ShapeGlyph};
+@@ -8,3 +7,0 @@ use crate::{AttrsList, AttrsOwned, HashMap, ShapeGlyph};
+-///
+-/// Attributes are ids from [`ShapeRunCache`]'s interner: two ids are equal
+-/// exactly when the [`AttrsOwned`] values they stand for are equal.
+@@ -14,2 +11,2 @@ pub struct ShapeRunKey {
+-    pub default_attrs: usize,
+-    pub attrs_spans: Vec<(Range<usize>, usize)>,
++    pub default_attrs: AttrsOwned,
++    pub attrs_spans: Vec<(Range<usize>, AttrsOwned)>,
+@@ -20 +16,0 @@ pub struct ShapeRunKey {
+-#[cfg_attr(not(feature = "shape-run-cache"), allow(dead_code))]
+@@ -24,8 +19,0 @@ pub struct ShapeRunCache {
+-    /// Allocation reuse for lookup keys that hit the cache.
+-    pub(crate) scratch_key: Option<ShapeRunKey>,
+-    /// Every distinct attribute set seen, with its id.
+-    attrs_ids: HashMap<AttrsOwned, usize>,
+-    /// Version of the attribute list last seen, with the id of its defaults.
+-    list: Option<(u64, usize)>,
+-    /// Ids of that list's spans, by span start.
+-    span_ids: HashMap<usize, usize>,
+@@ -34 +21,0 @@ pub struct ShapeRunCache {
+-#[cfg_attr(not(feature = "shape-run-cache"), allow(dead_code))]
+@@ -36,33 +22,0 @@ impl ShapeRunCache {
+-    fn intern(attrs_ids: &mut HashMap<AttrsOwned, usize>, attrs: &AttrsOwned) -> usize {
+-        if let Some(&id) = attrs_ids.get(attrs) {
+-            return id;
+-        }
+-        let id = attrs_ids.len();
+-        attrs_ids.insert(attrs.clone(), id);
+-        id
+-    }
+-
+-    /// Id of `attrs_list`'s defaults. Selects `attrs_list` for [`Self::span_attrs_id`].
+-    pub(crate) fn default_attrs_id(&mut self, attrs_list: &AttrsList) -> usize {
+-        match self.list {
+-            Some((version, id)) if version == attrs_list.version() => id,
+-            _ => {
+-                self.span_ids.clear();
+-                let id = Self::intern(&mut self.attrs_ids, attrs_list.defaults_owned());
+-                self.list = Some((attrs_list.version(), id));
+-                id
+-            }
+-        }
+-    }
+-
+-    /// Id of the span starting at `start` in the list last passed to
+-    /// [`Self::default_attrs_id`], whose attributes are `attrs`.
+-    pub(crate) fn span_attrs_id(&mut self, start: usize, attrs: &AttrsOwned) -> usize {
+-        if let Some(&id) = self.span_ids.get(&start) {
+-            return id;
+-        }
+-        let id = Self::intern(&mut self.attrs_ids, attrs);
+-        self.span_ids.insert(start, id);
+-        id
+-    }
+-

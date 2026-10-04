@@ -13,6 +13,7 @@ use unicode_script::{Script, UnicodeScript};
 use unicode_segmentation::UnicodeSegmentation;
 
 use crate::fallback::FontFallbackIter;
+use crate::attrs::SpanCursor;
 use crate::{
     math, Align, AttrsList, CacheKeyFlags, Color, CssLineBreak, CssOverflowWrap, CssWordBreak,
     Font, FontSystem, LayoutGlyph, LayoutLine, Metrics, Wrap,
@@ -116,6 +117,23 @@ impl fmt::Debug for ShapeBuffer {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.pad("ShapeBuffer { .. }")
     }
+}
+
+/// True when `unicode_bidi::BidiInfo` would see at most one paragraph whose
+/// levels are all zero: no paragraph separator, no strong RTL or Arabic
+/// number, and no embedding, override or isolate initiator.
+fn is_pure_ltr(line: &str) -> bool {
+    use unicode_bidi::BidiClass::{AL, AN, B, FSI, LRE, LRI, LRO, R, RLE, RLI, RLO};
+    line.chars().all(|c| {
+        if (c as u32) < 0x0590 {
+            !matches!(c, '\n' | '\r' | '\u{1c}'..='\u{1e}' | '\u{85}')
+        } else {
+            !matches!(
+                unicode_bidi::bidi_class(c),
+                AL | AN | B | FSI | LRE | LRI | LRO | R | RLE | RLI | RLO
+            )
+        }
+    })
 }
 
 fn shape_fallback(
@@ -254,6 +272,7 @@ fn shape_fallback(
     let mut missing = Vec::new();
     glyphs.reserve(glyph_infos.len());
     let glyph_start = glyphs.len();
+    let mut spans = SpanCursor::new(attrs_list);
     for (info, pos) in glyph_infos.iter().zip(glyph_positions.iter()) {
         let start_glyph = start_run + info.cluster as usize;
 
@@ -261,7 +280,7 @@ fn shape_fallback(
             missing.push(start_glyph);
         }
 
-        let attrs = attrs_list.get_span(start_glyph);
+        let attrs = spans.get(start_glyph);
         let x_advance = pos.x_advance as f32 / font_scale
             + attrs.letter_spacing_opt.map_or(0.0, |spacing| spacing.0);
         let y_advance = pos.y_advance as f32 / font_scale;
@@ -486,16 +505,30 @@ fn shape_run_cached(
     end_run: usize,
     span_rtl: bool,
 ) {
-    use crate::{AttrsOwned, ShapeRunKey};
+    use crate::ShapeRunKey;
 
     let run_range = start_run..end_run;
-    let mut key = ShapeRunKey {
-        text: line[run_range.clone()].to_string(),
-        default_attrs: AttrsOwned::new(&attrs_list.defaults()),
-        attrs_spans: Vec::new(),
+    let text = &line[run_range.clone()];
+    let run_cache = &mut font_system.shape_run_cache;
+    let default_attrs = run_cache.default_attrs_id(attrs_list);
+    // Reuse the previous lookup key's allocations; only a miss keeps the key.
+    let mut key = match run_cache.scratch_key.take() {
+        Some(mut key) => {
+            key.text.clear();
+            key.text.push_str(text);
+            key.default_attrs = default_attrs;
+            key.attrs_spans.clear();
+            key
+        }
+        None => ShapeRunKey {
+            text: text.to_string(),
+            default_attrs,
+            attrs_spans: Vec::new(),
+        },
     };
     for (attrs_range, attrs) in attrs_list.spans.overlapping(&run_range) {
-        if attrs == &key.default_attrs {
+        let attrs = run_cache.span_attrs_id(attrs_range.start, attrs);
+        if attrs == default_attrs {
             // Skip if attrs matches default attrs
             continue;
         }
@@ -503,16 +536,18 @@ fn shape_run_cached(
         let end = min(attrs_range.end, end_run).saturating_sub(start_run);
         if end > start {
             let range = start..end;
-            key.attrs_spans.push((range, attrs.clone()));
+            key.attrs_spans.push((range, attrs));
         }
     }
     if let Some(cache_glyphs) = font_system.shape_run_cache.get(&key) {
-        for mut glyph in cache_glyphs.iter().cloned() {
+        glyphs.extend(cache_glyphs.iter().map(|glyph| {
             // Adjust glyph start and end to match run position
+            let mut glyph = glyph.clone();
             glyph.start += start_run;
             glyph.end += start_run;
-            glyphs.push(glyph);
-        }
+            glyph
+        }));
+        font_system.shape_run_cache.scratch_key = Some(key);
         return;
     }
 
@@ -706,40 +741,45 @@ impl ShapeWord {
         }
     }
 
-    fn glyph_indices_for_offsets(&self, mut offsets: Vec<usize>) -> Vec<usize> {
-        offsets.sort_unstable();
-        offsets.dedup();
-        (1..self.glyphs.len())
-            .filter(|&index| {
-                let before = &self.glyphs[index - 1];
-                let after = &self.glyphs[index];
-                let offset = if before.end <= after.start {
-                    after.start
-                } else if after.end <= before.start {
-                    before.start
-                } else {
-                    return false;
-                };
-                offsets.binary_search(&offset).is_ok()
-            })
-            .collect()
+    /// `offsets` must be sorted and free of duplicates.
+    fn glyph_indices_for_offsets(glyphs: &[ShapeGlyph], offsets: &[usize], indices: &mut Vec<usize>) {
+        indices.clear();
+        if offsets.is_empty() {
+            return;
+        }
+        indices.extend((1..glyphs.len()).filter(|&index| {
+            let before = &glyphs[index - 1];
+            let after = &glyphs[index];
+            let offset = if before.end <= after.start {
+                after.start
+            } else if after.end <= before.start {
+                before.start
+            } else {
+                return false;
+            };
+            offsets.binary_search(&offset).is_ok()
+        }));
     }
 
     fn set_line_breaks(
         &mut self,
         custom: bool,
-        soft_offsets: impl Iterator<Item = usize>,
-        emergency_offsets: impl Iterator<Item = usize>,
-        min_content_offsets: impl Iterator<Item = usize>,
+        soft_offsets: &[usize],
+        emergency_offsets: &[usize],
+        min_content_offsets: &[usize],
     ) {
-        let soft_breaks = self.glyph_indices_for_offsets(soft_offsets.collect());
-        let emergency_breaks = self.glyph_indices_for_offsets(emergency_offsets.collect());
-        let min_content_breaks =
-            self.glyph_indices_for_offsets(min_content_offsets.collect());
+        Self::glyph_indices_for_offsets(&self.glyphs, soft_offsets, &mut self.soft_breaks);
+        Self::glyph_indices_for_offsets(
+            &self.glyphs,
+            emergency_offsets,
+            &mut self.emergency_breaks,
+        );
+        Self::glyph_indices_for_offsets(
+            &self.glyphs,
+            min_content_offsets,
+            &mut self.min_content_breaks,
+        );
         self.custom_line_breaks = custom;
-        self.soft_breaks = soft_breaks;
-        self.emergency_breaks = emergency_breaks;
-        self.min_content_breaks = min_content_breaks;
     }
 
     fn reverse_glyphs(&mut self) {
@@ -757,32 +797,28 @@ impl ShapeWord {
         }
     }
 
-    fn cluster_boundaries(&self) -> Vec<usize> {
-        (1..self.glyphs.len())
-            .filter(|&index| {
+    /// Append the glyph indices where this word may break. They are all
+    /// nonzero, so a caller's leading `0` stays first after sorting.
+    fn push_break_indices(&self, wrap: Wrap, use_emergency: bool, breaks: &mut Vec<usize>) {
+        if wrap == Wrap::Glyph || (!self.custom_line_breaks && use_emergency) {
+            breaks.extend((1..self.glyphs.len()).filter(|&index| {
                 let before = &self.glyphs[index - 1];
                 let after = &self.glyphs[index];
                 before.end <= after.start || after.end <= before.start
-            })
-            .collect()
-    }
-
-    fn break_indices(&self, wrap: Wrap, use_emergency: bool) -> Vec<usize> {
-        if wrap == Wrap::Glyph || (!self.custom_line_breaks && use_emergency) {
-            return self.cluster_boundaries();
+            }));
+            return;
         }
-        let mut breaks = self.soft_breaks.clone();
+        breaks.extend_from_slice(&self.soft_breaks);
         if use_emergency {
             let emergency = if wrap == Wrap::WordOrGlyphMinContent {
                 &self.min_content_breaks
             } else {
                 &self.emergency_breaks
             };
-            breaks.extend(emergency.iter().copied());
+            breaks.extend_from_slice(emergency);
             breaks.sort_unstable();
             breaks.dedup();
         }
-        breaks
     }
 
     /// Shape a word into a set of glyphs.
@@ -837,23 +873,39 @@ impl ShapeWord {
         let span_rtl = level.is_rtl();
 
         let mut start_run = word_range.start;
-        let mut attrs = attrs_list.defaults();
+        let mut attrs = attrs_list.defaults_owned();
+        let mut spans = SpanCursor::new(attrs_list);
+        let mut checked = None;
         for (egc_i, _egc) in word.grapheme_indices(true) {
             let start_egc = word_range.start + egc_i;
-            let attrs_egc = attrs_list.get_span(start_egc);
-            if !attrs.compatible(&attrs_egc) {
-                shaping.run(
-                    &mut glyphs,
-                    font_system,
-                    line,
-                    attrs_list,
-                    start_run,
-                    start_egc,
-                    span_rtl,
-                );
+            let attrs_egc = spans.get(start_egc);
+            // `attrs` is compatible with the attrs checked last, so only a
+            // different span can end the run.
+            if checked.is_some_and(|checked| core::ptr::eq(checked, attrs_egc)) {
+                continue;
+            }
+            checked = Some(attrs_egc);
+            let rest_in_span = spans.valid_until() >= word_range.end;
+            if !attrs.compatible(attrs_egc) {
+                // An empty run has no glyphs to shape.
+                if start_run < start_egc {
+                    shaping.run(
+                        &mut glyphs,
+                        font_system,
+                        line,
+                        attrs_list,
+                        start_run,
+                        start_egc,
+                        span_rtl,
+                    );
+                }
 
                 start_run = start_egc;
                 attrs = attrs_egc;
+            }
+            if rest_in_span {
+                // Every later grapheme maps to `checked`.
+                break;
             }
         }
         if start_run < word_range.end {
@@ -935,12 +987,12 @@ fn keep_all_word_class(class: BreakClass) -> bool {
 /// surrounding UAX#14 iterator continues to own punctuation, emoji, spaces,
 /// joiners, and mandatory breaks; this is the key distinction from terminal
 /// style "break character" wrapping.
-fn break_all_class(grapheme: &str) -> BreakClass {
+fn break_all_class(grapheme: &str, class: BreakClass) -> BreakClass {
     // Blink tailors PLUS SIGN to the alphabetic class for break-all.
     if grapheme == "+" {
         BreakClass::Alphabetic
     } else {
-        grapheme_break_class(grapheme)
+        class
     }
 }
 
@@ -1036,19 +1088,18 @@ struct CssBreakData {
 
 fn css_break_data(span: &str, span_start: usize, attrs_list: &AttrsList) -> CssBreakData {
     let normal_breaks: Vec<usize> = linebreaks(span).map(|(offset, _)| offset).collect();
-    let graphemes: Vec<GraphemeBreakData> = span
-        .grapheme_indices(true)
-        .map(|(start, grapheme)| {
-            let class = grapheme_break_class(grapheme);
-            GraphemeBreakData {
-                end: start + grapheme.len(),
-                class,
-                break_all_class: break_all_class(grapheme),
-                vertical_line: grapheme == "|",
-                policy: attrs_list.get_span(span_start + start).css_line_break,
-            }
-        })
-        .collect();
+    let mut spans = SpanCursor::new(attrs_list);
+    let mut graphemes = Vec::with_capacity(span.len());
+    graphemes.extend(span.grapheme_indices(true).map(|(start, grapheme)| {
+        let class = grapheme_break_class(grapheme);
+        GraphemeBreakData {
+            end: start + grapheme.len(),
+            class,
+            break_all_class: break_all_class(grapheme, class),
+            vertical_line: grapheme == "|",
+            policy: spans.get(span_start + start).css_line_break,
+        }
+    }));
     let mut data = CssBreakData {
         word_breaks: Vec::new(),
         soft_breaks: Vec::new(),
@@ -1056,12 +1107,15 @@ fn css_break_data(span: &str, span_start: usize, attrs_list: &AttrsList) -> CssB
         min_content_breaks: Vec::new(),
     };
 
+    // Both `normal_breaks` and the pair offsets increase strictly.
+    let mut normal_breaks = normal_breaks.into_iter().peekable();
     for pair in graphemes.windows(2) {
         let before = pair[0];
         let after = pair[1];
         let offset = before.end;
         let absolute = span_start + offset;
-        let normal_break = normal_breaks.binary_search(&offset).is_ok();
+        while normal_breaks.next_if(|&normal| normal < offset).is_some() {}
+        let normal_break = normal_breaks.peek() == Some(&offset);
         let Some(policy) = before.policy else {
             if normal_break {
                 data.word_breaks.push(offset);
@@ -1164,8 +1218,9 @@ impl ShapeSpan {
         let mut words = mem::take(&mut self.words);
 
         // Cache the shape words in reverse order so they can be popped for reuse in the same order.
+        // Words left over from earlier spans stay below this span's words as
+        // spare allocations for spans that grow, such as a freshly split line.
         let mut cached_words = mem::take(&mut font_system.shape_buffer.words);
-        cached_words.clear();
         if line_rtl != level.is_rtl() {
             // Un-reverse previous words so the internal glyph counts match accurately when rewriting memory.
             cached_words.append(&mut words);
@@ -1174,6 +1229,8 @@ impl ShapeSpan {
         }
 
         let breaks = css_break_data(span, span_range.start, attrs_list);
+        words.reserve(breaks.word_breaks.len());
+        let mut spans = SpanCursor::new(attrs_list);
         let mut start_word = 0;
         for end_lb in breaks.word_breaks.iter().copied() {
             let mut start_lb = end_lb;
@@ -1200,14 +1257,20 @@ impl ShapeSpan {
                     shaping,
                 );
                 let absolute = (span_range.start + start_word)..(span_range.start + start_lb);
-                let custom = line[absolute.clone()]
-                    .char_indices()
-                    .any(|(offset, _)| {
-                        attrs_list
-                            .get_span(absolute.start + offset)
-                            .css_line_break
-                            .is_some()
-                    });
+                // Whether any character starts where a CSS policy applies,
+                // checking the first character of each attribute run.
+                let mut custom = false;
+                let mut offset = absolute.start;
+                while offset < absolute.end {
+                    if spans.get(offset).css_line_break.is_some() {
+                        custom = true;
+                        break;
+                    }
+                    offset = spans.valid_until();
+                    while offset < absolute.end && !line.is_char_boundary(offset) {
+                        offset += 1;
+                    }
+                }
                 let soft_start = breaks
                     .soft_breaks
                     .partition_point(|offset| *offset <= absolute.start);
@@ -1228,13 +1291,9 @@ impl ShapeSpan {
                     .partition_point(|offset| *offset < absolute.end);
                 word.set_line_breaks(
                     custom,
-                    breaks.soft_breaks[soft_start..soft_end].iter().copied(),
-                    breaks.emergency_breaks[emergency_start..emergency_end]
-                        .iter()
-                        .copied(),
-                    breaks.min_content_breaks[min_start..min_end]
-                        .iter()
-                        .copied(),
+                    &breaks.soft_breaks[soft_start..soft_end],
+                    &breaks.emergency_breaks[emergency_start..emergency_end],
+                    &breaks.min_content_breaks[min_start..min_end],
                 );
                 words.push(word);
             }
@@ -1254,16 +1313,8 @@ impl ShapeSpan {
                     );
                     let absolute = (span_range.start + start_lb + i)
                         ..(span_range.start + start_lb + i + c.len_utf8());
-                    let custom = attrs_list
-                        .get_span(absolute.start)
-                        .css_line_break
-                        .is_some();
-                    word.set_line_breaks(
-                        custom,
-                        core::iter::empty(),
-                        core::iter::empty(),
-                        core::iter::empty(),
-                    );
+                    let custom = spans.get(absolute.start).css_line_break.is_some();
+                    word.set_line_breaks(custom, &[], &[], &[]);
                     words.push(word);
                 }
             }
@@ -1368,83 +1419,104 @@ impl ShapeLine {
         cached_spans.clear();
         cached_spans.extend(spans.drain(..).rev());
 
-        let bidi = unicode_bidi::BidiInfo::new(line, None);
-        let rtl = if bidi.paragraphs.is_empty() {
+        let rtl = if is_pure_ltr(line) {
+            log::trace!("Line LTR: '{}'", line);
+            if !line.is_empty() {
+                let mut span = cached_spans.pop().unwrap_or_else(ShapeSpan::empty);
+                span.build(
+                    font_system,
+                    line,
+                    attrs_list,
+                    0..line.len(),
+                    false,
+                    unicode_bidi::Level::ltr(),
+                    shaping,
+                );
+                spans.push(span);
+            }
             false
         } else {
-            bidi.paragraphs[0].level.is_rtl()
+            let bidi = unicode_bidi::BidiInfo::new(line, None);
+            let rtl = if bidi.paragraphs.is_empty() {
+                false
+            } else {
+                bidi.paragraphs[0].level.is_rtl()
+            };
+
+            log::trace!("Line {}: '{}'", if rtl { "RTL" } else { "LTR" }, line);
+
+            for para_info in bidi.paragraphs.iter() {
+                let line_rtl = para_info.level.is_rtl();
+                assert_eq!(line_rtl, rtl);
+
+                let line_range = para_info.range.clone();
+                let levels = Self::adjust_levels(&unicode_bidi::Paragraph::new(&bidi, para_info));
+
+                // Find consecutive level runs. We use this to create Spans.
+                // Each span is a set of characters with equal levels.
+                let mut start = line_range.start;
+                let mut run_level = levels[start];
+                spans.reserve(line_range.end - start + 1);
+
+                for (i, &new_level) in levels
+                    .iter()
+                    .enumerate()
+                    .take(line_range.end)
+                    .skip(start + 1)
+                {
+                    if new_level != run_level {
+                        // End of the previous run, start of a new one.
+                        let mut span = cached_spans.pop().unwrap_or_else(ShapeSpan::empty);
+                        span.build(
+                            font_system,
+                            line,
+                            attrs_list,
+                            start..i,
+                            line_rtl,
+                            run_level,
+                            shaping,
+                        );
+                        spans.push(span);
+                        start = i;
+                        run_level = new_level;
+                    }
+                }
+                let mut span = cached_spans.pop().unwrap_or_else(ShapeSpan::empty);
+                span.build(
+                    font_system,
+                    line,
+                    attrs_list,
+                    start..line_range.end,
+                    line_rtl,
+                    run_level,
+                    shaping,
+                );
+                spans.push(span);
+            }
+            rtl
         };
 
-        log::trace!("Line {}: '{}'", if rtl { "RTL" } else { "LTR" }, line);
-
-        for para_info in bidi.paragraphs.iter() {
-            let line_rtl = para_info.level.is_rtl();
-            assert_eq!(line_rtl, rtl);
-
-            let line_range = para_info.range.clone();
-            let levels = Self::adjust_levels(&unicode_bidi::Paragraph::new(&bidi, para_info));
-
-            // Find consecutive level runs. We use this to create Spans.
-            // Each span is a set of characters with equal levels.
-            let mut start = line_range.start;
-            let mut run_level = levels[start];
-            spans.reserve(line_range.end - start + 1);
-
-            for (i, &new_level) in levels
-                .iter()
-                .enumerate()
-                .take(line_range.end)
-                .skip(start + 1)
-            {
-                if new_level != run_level {
-                    // End of the previous run, start of a new one.
-                    let mut span = cached_spans.pop().unwrap_or_else(ShapeSpan::empty);
-                    span.build(
-                        font_system,
-                        line,
-                        attrs_list,
-                        start..i,
-                        line_rtl,
-                        run_level,
-                        shaping,
-                    );
-                    spans.push(span);
-                    start = i;
-                    run_level = new_level;
-                }
-            }
-            let mut span = cached_spans.pop().unwrap_or_else(ShapeSpan::empty);
-            span.build(
-                font_system,
-                line,
-                attrs_list,
-                start..line_range.end,
-                line_rtl,
-                run_level,
-                shaping,
-            );
-            spans.push(span);
-        }
-
         // Adjust for tabs
-        let mut x = 0.0;
-        for span in spans.iter_mut() {
-            for word in span.words.iter_mut() {
-                for glyph in word.glyphs.iter_mut() {
-                    if line.get(glyph.start..glyph.end) == Some("\t") {
-                        // Tabs are shaped as spaces, so they will always have the x_advance of a space.
-                        let tab_x_advance = (tab_width as f32) * glyph.x_advance;
-                        let tab_stop = (math::floorf(x / tab_x_advance) + 1.0) * tab_x_advance;
-                        glyph.x_advance = tab_stop - x;
+        if line.contains('\t') {
+            let mut x = 0.0;
+            for span in spans.iter_mut() {
+                for word in span.words.iter_mut() {
+                    for glyph in word.glyphs.iter_mut() {
+                        if line.get(glyph.start..glyph.end) == Some("\t") {
+                            // Tabs are shaped as spaces, so they will always have the x_advance of a space.
+                            let tab_x_advance = (tab_width as f32) * glyph.x_advance;
+                            let tab_stop = (math::floorf(x / tab_x_advance) + 1.0) * tab_x_advance;
+                            glyph.x_advance = tab_stop - x;
+                        }
+                        x += glyph.x_advance;
                     }
-                    x += glyph.x_advance;
                 }
             }
         }
 
         self.rtl = rtl;
         self.spans = spans;
-        self.metrics_opt = attrs_list.defaults().metrics_opt.map(|x| x.into());
+        self.metrics_opt = attrs_list.defaults_owned().metrics_opt.map(|x| x.into());
 
         // Return the buffer for later reuse.
         font_system.shape_buffer.spans = cached_spans;
@@ -1601,17 +1673,19 @@ impl ShapeLine {
         // For each visual line a list of  (span index,  and range of words in that span)
         // Note that a BiDi visual line could have multiple spans or parts of them
         // let mut vl_range_of_spans = Vec::with_capacity(1);
+        // `visual_lines` is empty between calls; `cached_visual_lines` is a
+        // pool of uncleared lines, cleared when taken.
         let mut visual_lines = mem::take(&mut scratch.visual_lines);
         let mut cached_visual_lines = mem::take(&mut scratch.cached_visual_lines);
-        cached_visual_lines.clear();
-        cached_visual_lines.extend(visual_lines.drain(..).map(|mut l| {
-            l.clear();
-            l
-        }));
+        fn take_visual_line(pool: &mut Vec<VisualLine>) -> VisualLine {
+            let mut line = pool.pop().unwrap_or_default();
+            line.clear();
+            line
+        }
 
         // Cache glyph sets in reverse order so they will ideally be reused in exactly the same lines.
+        // Glyph sets left over from earlier lines are kept as spare allocations.
         let mut cached_glyph_sets = mem::take(&mut scratch.glyph_sets);
-        cached_glyph_sets.clear();
         cached_glyph_sets.extend(layout_lines.drain(..).rev().map(|mut v| {
             v.glyphs.clear();
             v.glyphs
@@ -1638,7 +1712,9 @@ impl ShapeLine {
         // If one span is too large, this variable will hold the range of words inside that span
         // that fits on a line.
         // let mut current_visual_line: Vec<VlRange> = Vec::with_capacity(1);
-        let mut current_visual_line = cached_visual_lines.pop().unwrap_or_default();
+        let mut current_visual_line = take_visual_line(&mut cached_visual_lines);
+        // Word break positions, with a leading 0, for the word being wrapped.
+        let mut boundaries = Vec::new();
 
         if wrap == Wrap::None {
             for (span_index, span) in self.spans.iter().enumerate() {
@@ -1696,8 +1772,10 @@ impl ShapeLine {
                                     wrap,
                                     Wrap::WordOrGlyph | Wrap::WordOrGlyphMinContent
                                 ) && word_width > width_opt.unwrap_or(f32::INFINITY));
-                            let break_indices = word.break_indices(wrap, emergency);
-                            if !break_indices.is_empty() {
+                            boundaries.clear();
+                            boundaries.push(0);
+                            word.push_break_indices(wrap, emergency, &mut boundaries);
+                            if boundaries.len() > 1 {
                             // Commit the current line so that the word starts on the next line.
                             if word_range_width > 0.
                                 && word.soft_breaks.is_empty()
@@ -1717,7 +1795,7 @@ impl ShapeLine {
                                 );
 
                                 visual_lines.push(current_visual_line);
-                                current_visual_line = cached_visual_lines.pop().unwrap_or_default();
+                                current_visual_line = take_visual_line(&mut cached_visual_lines);
 
                                 number_of_blanks = 0;
                                 word_range_width = 0.;
@@ -1725,9 +1803,6 @@ impl ShapeLine {
                                 fitting_start = (i, 0);
                             }
 
-                            let mut boundaries = Vec::with_capacity(break_indices.len() + 2);
-                            boundaries.push(0);
-                            boundaries.extend(break_indices);
                             boundaries.push(word.glyphs.len());
                             for chunk in boundaries.windows(2).rev() {
                                 let start = chunk[0];
@@ -1754,7 +1829,7 @@ impl ShapeLine {
                                     );
                                     visual_lines.push(current_visual_line);
                                     current_visual_line =
-                                        cached_visual_lines.pop().unwrap_or_default();
+                                        take_visual_line(&mut cached_visual_lines);
 
                                     number_of_blanks = 0;
                                     word_range_width = chunk_width;
@@ -1795,7 +1870,7 @@ impl ShapeLine {
                                 }
 
                                 visual_lines.push(current_visual_line);
-                                current_visual_line = cached_visual_lines.pop().unwrap_or_default();
+                                current_visual_line = take_visual_line(&mut cached_visual_lines);
                                 number_of_blanks = 0;
                             }
 
@@ -1842,8 +1917,10 @@ impl ShapeLine {
                                     wrap,
                                     Wrap::WordOrGlyph | Wrap::WordOrGlyphMinContent
                                 ) && word_width > width_opt.unwrap_or(f32::INFINITY));
-                            let break_indices = word.break_indices(wrap, emergency);
-                            if !break_indices.is_empty() {
+                            boundaries.clear();
+                            boundaries.push(0);
+                            word.push_break_indices(wrap, emergency, &mut boundaries);
+                            if boundaries.len() > 1 {
                             // Commit the current line so that the word starts on the next line.
                             if word_range_width > 0.
                                 && word.soft_breaks.is_empty()
@@ -1863,7 +1940,7 @@ impl ShapeLine {
                                 );
 
                                 visual_lines.push(current_visual_line);
-                                current_visual_line = cached_visual_lines.pop().unwrap_or_default();
+                                current_visual_line = take_visual_line(&mut cached_visual_lines);
 
                                 number_of_blanks = 0;
                                 word_range_width = 0.;
@@ -1871,9 +1948,6 @@ impl ShapeLine {
                                 fitting_start = (i, 0);
                             }
 
-                            let mut boundaries = Vec::with_capacity(break_indices.len() + 2);
-                            boundaries.push(0);
-                            boundaries.extend(break_indices);
                             boundaries.push(word.glyphs.len());
                             for chunk in boundaries.windows(2) {
                                 let start = chunk[0];
@@ -1900,7 +1974,7 @@ impl ShapeLine {
                                     );
                                     visual_lines.push(current_visual_line);
                                     current_visual_line =
-                                        cached_visual_lines.pop().unwrap_or_default();
+                                        take_visual_line(&mut cached_visual_lines);
 
                                     number_of_blanks = 0;
                                     word_range_width = chunk_width;
@@ -1938,7 +2012,7 @@ impl ShapeLine {
                                 }
 
                                 visual_lines.push(current_visual_line);
-                                current_visual_line = cached_visual_lines.pop().unwrap_or_default();
+                                current_visual_line = take_visual_line(&mut cached_visual_lines);
                                 number_of_blanks = 0;
                             }
 
@@ -1994,14 +2068,34 @@ impl ShapeLine {
         let start_x = if self.rtl { line_width } else { 0.0 };
 
         let number_of_visual_lines = visual_lines.len();
+        layout_lines.reserve(number_of_visual_lines);
         for (index, visual_line) in visual_lines.iter().enumerate() {
             if visual_line.ranges.is_empty() {
                 continue;
             }
-            let new_order = self.reorder(&visual_line.ranges);
             let mut glyphs = cached_glyph_sets
                 .pop()
                 .unwrap_or_else(|| Vec::with_capacity(1));
+            glyphs.reserve(
+                visual_line
+                    .ranges
+                    .iter()
+                    .map(|&(span_index, (starting_word, starting_glyph), (ending_word, ending_glyph))| {
+                        let words = &self.spans[span_index].words;
+                        (starting_word..ending_word + usize::from(ending_glyph != 0))
+                            .map(|i| {
+                                let end = if i == ending_word {
+                                    ending_glyph
+                                } else {
+                                    words[i].glyphs.len()
+                                };
+                                let start = if i == starting_word { starting_glyph } else { 0 };
+                                end.saturating_sub(start)
+                            })
+                            .sum::<usize>()
+                    })
+                    .sum(),
+            );
             let mut x = start_x;
             let mut y = 0.;
             let mut max_ascent: f32 = 0.;
@@ -2115,13 +2209,21 @@ impl ShapeLine {
                 }
             };
 
-            if self.rtl {
-                for range in new_order.into_iter().rev() {
+            let first_level = self.spans[visual_line.ranges[0].0].level;
+            if visual_line
+                .ranges
+                .iter()
+                .all(|&(span_index, _, _)| self.spans[span_index].level == first_level)
+            {
+                // A single level run needs no reordering.
+                process_range(0..visual_line.ranges.len());
+            } else if self.rtl {
+                for range in self.reorder(&visual_line.ranges).into_iter().rev() {
                     process_range(range);
                 }
             } else {
                 /* LTR */
-                for range in new_order {
+                for range in self.reorder(&visual_line.ranges) {
                     process_range(range);
                 }
             }
@@ -2163,9 +2265,40 @@ impl ShapeLine {
         }
 
         // Restore the buffer to the scratch set to prevent reallocations.
+        cached_visual_lines.append(&mut visual_lines);
         scratch.visual_lines = visual_lines;
-        scratch.visual_lines.append(&mut cached_visual_lines);
         scratch.cached_visual_lines = cached_visual_lines;
         scratch.glyph_sets = cached_glyph_sets;
+    }
+}
+
+#[cfg(all(test, feature = "std"))]
+mod pure_ltr_tests {
+    use super::is_pure_ltr;
+    use unicode_bidi::{bidi_class, BidiClass::*, BidiInfo, Level};
+
+    #[test]
+    fn pure_ltr_lines_have_one_ltr_paragraph() {
+        for c in (0..0x3_0000u32).filter_map(char::from_u32) {
+            let text = format!("a{c}b");
+            let pure = is_pure_ltr(&text);
+            if pure {
+                let bidi = BidiInfo::new(&text, None);
+                assert_eq!(bidi.paragraphs.len(), 1, "{c:?}");
+                assert_eq!(bidi.paragraphs[0].range, 0..text.len(), "{c:?}");
+                assert_eq!(bidi.paragraphs[0].level, Level::ltr(), "{c:?}");
+                assert!(bidi.levels.iter().all(|level| *level == Level::ltr()), "{c:?}");
+            }
+            if (c as u32) < 0x0590 {
+                let excluded = matches!(
+                    bidi_class(c),
+                    AL | AN | B | FSI | LRE | LRI | LRO | R | RLE | RLI | RLO
+                );
+                assert_eq!(pure, !excluded, "{c:?}");
+            }
+        }
+        assert!(is_pure_ltr(""));
+        assert!(!is_pure_ltr("abc \u{5d0}"));
+        assert!(!is_pure_ltr("abc\ndef"));
     }
 }

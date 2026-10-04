@@ -4,6 +4,7 @@
 use alloc::vec::Vec;
 use core::hash::{Hash, Hasher};
 use core::ops::Range;
+use core::sync::atomic::{AtomicU64, Ordering};
 use rangemap::RangeMap;
 use smol_str::SmolStr;
 
@@ -628,15 +629,84 @@ impl AttrsOwned {
             css_line_break: self.css_line_break,
         }
     }
+
+    /// Same result as [`Attrs::compatible`] on the borrowed forms.
+    pub(crate) fn compatible(&self, other: &Self) -> bool {
+        self.family_owned == other.family_owned
+            && self.font_id_opt == other.font_id_opt
+            && self.font_weight_axis_opt == other.font_weight_axis_opt
+            && self.font_optical_size_opt == other.font_optical_size_opt
+            && self.font_italic_axis == other.font_italic_axis
+            && self.stretch == other.stretch
+            && self.style == other.style
+            && self.weight == other.weight
+            && self.font_variations == other.font_variations
+    }
+}
+
+/// Forward lookup of span attributes that reuses the last span found while
+/// the queried index stays inside it.
+pub(crate) struct SpanCursor<'a> {
+    list: &'a AttrsList,
+    attrs: &'a AttrsOwned,
+    start: usize,
+    end: usize,
+}
+
+impl<'a> SpanCursor<'a> {
+    pub(crate) fn new(list: &'a AttrsList) -> Self {
+        Self {
+            list,
+            attrs: &list.defaults,
+            start: 0,
+            end: 0,
+        }
+    }
+
+    /// Same attributes as [`AttrsList::get_span`] for `index`.
+    pub(crate) fn get(&mut self, index: usize) -> &'a AttrsOwned {
+        if index < self.start || index >= self.end {
+            let (attrs, end) = match self.list.spans.overlapping(index..usize::MAX).next() {
+                Some((range, attrs)) if range.start <= index => (attrs, range.end),
+                Some((range, _)) => (&self.list.defaults, range.start),
+                None => (&self.list.defaults, usize::MAX),
+            };
+            self.attrs = attrs;
+            self.start = index;
+            self.end = end;
+        }
+        self.attrs
+    }
+
+    /// End of the index range that shares the attributes last returned.
+    pub(crate) fn valid_until(&self) -> usize {
+        self.end
+    }
+}
+
+fn next_attrs_list_version() -> u64 {
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    NEXT.fetch_add(1, Ordering::Relaxed)
 }
 
 /// List of text attributes to apply to a line
 //TODO: have this clean up the spans when changes are made
-#[derive(Debug, Clone, Eq, PartialEq)]
+#[derive(Debug, Clone)]
 pub struct AttrsList {
     defaults: AttrsOwned,
     pub(crate) spans: RangeMap<usize, AttrsOwned>,
+    /// Process-unique id of these contents, replaced on every change and
+    /// shared by clones. Keys the shape-run cache's per-list memo.
+    version: u64,
 }
+
+impl PartialEq for AttrsList {
+    fn eq(&self, other: &Self) -> bool {
+        self.defaults == other.defaults && self.spans == other.spans
+    }
+}
+
+impl Eq for AttrsList {}
 
 impl AttrsList {
     /// Create a new attributes list with a set of default [Attrs]
@@ -644,12 +714,21 @@ impl AttrsList {
         Self {
             defaults: AttrsOwned::new(defaults),
             spans: RangeMap::new(),
+            version: next_attrs_list_version(),
         }
+    }
+
+    pub(crate) fn version(&self) -> u64 {
+        self.version
     }
 
     /// Get the default [Attrs]
     pub fn defaults(&self) -> Attrs {
         self.defaults.as_attrs()
+    }
+
+    pub(crate) fn defaults_owned(&self) -> &AttrsOwned {
+        &self.defaults
     }
 
     /// Get the current attribute spans
@@ -665,6 +744,7 @@ impl AttrsList {
     /// Clear the current attribute spans
     pub fn clear_spans(&mut self) {
         self.spans.clear();
+        self.version = next_attrs_list_version();
     }
 
     /// Add an attribute span, removes any previous matching parts of spans
@@ -675,6 +755,7 @@ impl AttrsList {
         }
 
         self.spans.insert(range, AttrsOwned::new(attrs));
+        self.version = next_attrs_list_version();
     }
 
     /// Get the attribute span for an index
@@ -683,43 +764,38 @@ impl AttrsList {
     pub fn get_span(&self, index: usize) -> Attrs {
         self.spans
             .get(&index)
-            .map(|v| v.as_attrs())
-            .unwrap_or(self.defaults.as_attrs())
+            .unwrap_or(&self.defaults)
+            .as_attrs()
     }
 
     /// Split attributes list at an offset
-    #[allow(clippy::missing_panics_doc)]
     pub fn split_off(&mut self, index: usize) -> Self {
-        let mut new = Self::new(&self.defaults.as_attrs());
-        let mut removes = Vec::new();
-
-        //get the keys we need to remove or fix.
-        for span in self.spans.iter() {
-            if span.0.end <= index {
-                continue;
-            } else if span.0.start >= index {
-                removes.push((span.0.clone(), false));
+        let mut new = Self {
+            defaults: self.defaults.clone(),
+            spans: RangeMap::new(),
+            version: next_attrs_list_version(),
+        };
+        if self
+            .spans
+            .last_range_value()
+            .map_or(true, |(range, _)| range.end <= index)
+        {
+            return new;
+        }
+        // Rebuilding the head is cheaper than removing the tail span by span.
+        let mut head = RangeMap::new();
+        for (range, attrs) in core::mem::take(&mut self.spans) {
+            if range.end <= index {
+                head.insert(range, attrs);
+            } else if range.start < index {
+                head.insert(range.start..index, attrs.clone());
+                new.spans.insert(0..range.end - index, attrs);
             } else {
-                removes.push((span.0.clone(), true));
+                new.spans.insert(range.start - index..range.end - index, attrs);
             }
         }
-
-        for (key, resize) in removes {
-            let (range, attrs) = self
-                .spans
-                .get_key_value(&key.start)
-                .map(|v| (v.0.clone(), v.1.clone()))
-                .expect("attrs span not found");
-            self.spans.remove(key);
-
-            if resize {
-                new.spans.insert(0..range.end - index, attrs.clone());
-                self.spans.insert(range.start..index, attrs);
-            } else {
-                new.spans
-                    .insert(range.start - index..range.end - index, attrs);
-            }
-        }
+        self.spans = head;
+        self.version = next_attrs_list_version();
         new
     }
 
@@ -727,15 +803,56 @@ impl AttrsList {
     pub(crate) fn reset(mut self, default: &Attrs) -> Self {
         self.defaults = AttrsOwned::new(default);
         self.spans.clear();
+        self.version = next_attrs_list_version();
         self
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{Attrs, AttrsOwned, FontVariations, VariationTag};
+    use super::{Attrs, AttrsList, AttrsOwned, Color, FontVariations, SpanCursor, VariationTag};
     use core::hash::{Hash, Hasher};
     use std::collections::hash_map::DefaultHasher;
+
+    fn sample_list() -> AttrsList {
+        let mut list = AttrsList::new(&Attrs::new());
+        list.add_span(2..5, &Attrs::new().color(Color(1)));
+        list.add_span(5..9, &Attrs::new().color(Color(2)));
+        list.add_span(12..20, &Attrs::new().color(Color(1)));
+        list
+    }
+
+    #[test]
+    fn span_cursor_matches_get_span() {
+        let list = sample_list();
+        let mut cursor = SpanCursor::new(&list);
+        for index in (0..24).chain((0..24).rev()).chain([7, 3, 15, 0, 22]) {
+            assert_eq!(cursor.get(index).as_attrs(), list.get_span(index), "{index}");
+            assert!(cursor.valid_until() > index);
+        }
+    }
+
+    #[test]
+    fn split_off_keeps_every_index_and_changes_versions() {
+        for index in 0..24 {
+            let mut head = sample_list();
+            let version = head.version();
+            let tail = head.split_off(index);
+            let whole = sample_list();
+            for i in 0..24 {
+                let expected = whole.get_span(i);
+                if i < index {
+                    assert_eq!(head.get_span(i), expected, "{index} {i}");
+                } else {
+                    assert_eq!(tail.get_span(i - index), expected, "{index} {i}");
+                }
+            }
+            assert!(head.spans_iter().all(|(range, _)| range.end <= index));
+            assert_ne!(tail.version(), version);
+            let changed = whole.spans_iter().any(|(range, _)| range.end > index);
+            assert_eq!(head.version() != version, changed, "{index}");
+        }
+    }
 
     fn hash(value: impl Hash) -> u64 {
         let mut hasher = DefaultHasher::new();

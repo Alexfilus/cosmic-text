@@ -182,6 +182,10 @@ impl BufferLine {
 
         let mut new = Self::new(text, self.ending, attrs_list, self.shaping);
         new.align = self.align;
+        // Both halves must reshape. The tail is usually the longer one, so it
+        // takes the unused shape and layout allocations.
+        mem::swap(&mut new.shape_opt, &mut self.shape_opt);
+        mem::swap(&mut new.layout_opt, &mut self.layout_opt);
         new
     }
 

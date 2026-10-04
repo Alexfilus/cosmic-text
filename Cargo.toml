@@ -84,6 +84,10 @@ opt-level = 1
 features = ["vi"]
 
 [[bench]]
+name = "shaping_allocation_reuse"
+harness = false
+
+[[bench]]
 name = "shaping_fast_paths"
 harness = false
 
