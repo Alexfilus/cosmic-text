@@ -104,6 +104,28 @@ impl fmt::Debug for ShapeBuffer {
     }
 }
 
+#[inline]
+fn is_cursive_script(script: Script) -> bool {
+    matches!(
+        script,
+        Script::Arabic
+            | Script::Hanifi_Rohingya
+            | Script::Mandaic
+            | Script::Mongolian
+            | Script::Nko
+            | Script::Phags_Pa
+            | Script::Syriac
+    )
+}
+
+#[inline]
+fn cluster_allows_letter_spacing(line: &str, cluster_start: usize) -> bool {
+    line[cluster_start..]
+        .chars()
+        .next()
+        .map_or(true, |base| !is_cursive_script(base.script()))
+}
+
 fn shape_fallback(
     scratch: &mut ShapeBuffer,
     glyphs: &mut Vec<ShapeGlyph>,
@@ -166,7 +188,7 @@ fn shape_fallback(
     let mut missing = Vec::new();
     glyphs.reserve(glyph_infos.len());
     let glyph_start = glyphs.len();
-    for (info, pos) in glyph_infos.iter().zip(glyph_positions.iter()) {
+    for (glyph_index, (info, pos)) in glyph_infos.iter().zip(glyph_positions.iter()).enumerate() {
         let start_glyph = start_run + info.cluster as usize;
 
         if info.glyph_id == 0 {
@@ -174,8 +196,28 @@ fn shape_fallback(
         }
 
         let attrs = attrs_list.get_span(start_glyph);
-        let x_advance = pos.x_advance as f32 / font_scale
-            + attrs.letter_spacing_opt.map_or(0.0, |spacing| spacing.0);
+        // Rustybuzz can emit several glyphs for one character cluster (for
+        // example a base plus combining marks). Apply tracking once, after the
+        // final glyph in Rustybuzz's cluster order, instead of once per glyph.
+        //
+        // ShapeSpan reverses every word's glyphs for an overall RTL line. The
+        // final glyph here therefore becomes the first stored glyph there,
+        // which puts the added advance on the physical right of both LTR and
+        // RTL clusters without separating a base from its marks.
+        let letter_spacing = match attrs.letter_spacing_opt {
+            Some(spacing) if spacing.0 != 0.0 => {
+                let cluster_end = glyph_infos
+                    .get(glyph_index + 1)
+                    .map_or(true, |next| next.cluster != info.cluster);
+                if cluster_end && cluster_allows_letter_spacing(line, start_glyph) {
+                    spacing.0
+                } else {
+                    0.0
+                }
+            }
+            _ => 0.0,
+        };
+        let x_advance = pos.x_advance as f32 / font_scale + letter_spacing;
         let y_advance = pos.y_advance as f32 / font_scale;
         let x_offset = pos.x_offset as f32 / font_scale;
         let y_offset = pos.y_offset as f32 / font_scale;
@@ -1640,5 +1682,227 @@ impl ShapeLine {
         scratch.visual_lines.append(&mut cached_visual_lines);
         scratch.cached_visual_lines = cached_visual_lines;
         scratch.glyph_sets = cached_glyph_sets;
+    }
+}
+
+#[cfg(all(test, feature = "std"))]
+mod letter_spacing_tests {
+    use super::*;
+    use crate::{fontdb, Attrs, Family};
+
+    const TRACKING_EM: f32 = 0.125;
+    const EPSILON: f32 = 0.000_01;
+
+    fn font_system() -> FontSystem {
+        let mut db = fontdb::Database::new();
+        db.load_font_data(include_bytes!("../fonts/NotoSans-Regular.ttf").to_vec());
+        db.load_font_data(include_bytes!("../fonts/NotoSansHebrew.ttf").to_vec());
+        db.load_font_data(include_bytes!("../fonts/NotoSansArabic.ttf").to_vec());
+        FontSystem::new_with_locale_and_db("en-US".into(), db)
+    }
+
+    fn shape(text: &str, family: &'static str, spacing: Option<f32>) -> ShapeLine {
+        let mut font_system = font_system();
+        let mut attrs = Attrs::new().family(Family::Name(family));
+        if let Some(spacing) = spacing {
+            attrs = attrs.letter_spacing(spacing);
+        }
+        ShapeLine::new(
+            &mut font_system,
+            text,
+            &AttrsList::new(&attrs),
+            Shaping::Advanced,
+            8,
+        )
+    }
+
+    fn glyphs(line: &ShapeLine) -> Vec<&ShapeGlyph> {
+        line.spans
+            .iter()
+            .flat_map(|span| span.words.iter())
+            .flat_map(|word| word.glyphs.iter())
+            .collect()
+    }
+
+    fn assert_close(actual: f32, expected: f32) {
+        assert!(
+            (actual - expected).abs() <= EPSILON,
+            "expected {expected}, got {actual}"
+        );
+    }
+
+    fn assert_same_shaping(left: &ShapeLine, right: &ShapeLine) {
+        let left = glyphs(left);
+        let right = glyphs(right);
+        assert_eq!(left.len(), right.len());
+        for (left, right) in left.into_iter().zip(right) {
+            assert_eq!(
+                (left.start, left.end, left.font_id, left.glyph_id),
+                (right.start, right.end, right.font_id, right.glyph_id)
+            );
+            assert_eq!(left.x_advance.to_bits(), right.x_advance.to_bits());
+            assert_eq!(left.y_advance.to_bits(), right.y_advance.to_bits());
+            assert_eq!(left.x_offset.to_bits(), right.x_offset.to_bits());
+            assert_eq!(left.y_offset.to_bits(), right.y_offset.to_bits());
+        }
+    }
+
+    #[test]
+    fn default_and_explicit_zero_have_identical_shaping() {
+        let default = shape("office x\u{301}\u{323}", "Noto Sans", None);
+        let zero = shape("office x\u{301}\u{323}", "Noto Sans", Some(0.0));
+        assert_same_shaping(&default, &zero);
+    }
+
+    #[test]
+    fn decomposed_marks_receive_one_advance_per_rustybuzz_cluster() {
+        let default = shape("x\u{301}\u{323}y", "Noto Sans", None);
+        let tracked = shape("x\u{301}\u{323}y", "Noto Sans", Some(TRACKING_EM));
+        assert!(!default.rtl);
+
+        let default_glyphs = glyphs(&default);
+        let tracked_glyphs = glyphs(&tracked);
+        assert_eq!(default_glyphs.len(), tracked_glyphs.len());
+
+        let mut cluster_count = 0;
+        let mut found_multi_glyph_cluster = false;
+        let mut start = 0;
+        while start < default_glyphs.len() {
+            let cluster = default_glyphs[start].start;
+            let mut end = start + 1;
+            while end < default_glyphs.len() && default_glyphs[end].start == cluster {
+                end += 1;
+            }
+            cluster_count += 1;
+            found_multi_glyph_cluster |= end - start > 1;
+
+            for index in start..end - 1 {
+                assert_close(
+                    tracked_glyphs[index].x_advance,
+                    default_glyphs[index].x_advance,
+                );
+            }
+            assert_close(
+                tracked_glyphs[end - 1].x_advance,
+                default_glyphs[end - 1].x_advance + TRACKING_EM,
+            );
+            start = end;
+        }
+
+        assert!(
+            found_multi_glyph_cluster,
+            "the test font must keep at least one decomposed mark as a separate glyph"
+        );
+        let default_width = default.layout(32.0, None, Wrap::None, None, None)[0].w;
+        let tracked_width = tracked.layout(32.0, None, Wrap::None, None, None)[0].w;
+        assert_close(
+            tracked_width - default_width,
+            cluster_count as f32 * TRACKING_EM * 32.0,
+        );
+    }
+
+    #[test]
+    fn rtl_cluster_spacing_survives_visual_order_reversal() {
+        let text = "ש\u{5b8}ב";
+        let default = shape(text, "Noto Sans Hebrew", None);
+        let tracked = shape(text, "Noto Sans Hebrew", Some(TRACKING_EM));
+        assert!(default.rtl);
+
+        let default_glyphs = glyphs(&default);
+        let tracked_glyphs = glyphs(&tracked);
+        assert_eq!(default_glyphs.len(), tracked_glyphs.len());
+
+        let mut cluster_count = 0;
+        let mut found_multi_glyph_cluster = false;
+        let mut start = 0;
+        while start < default_glyphs.len() {
+            let cluster = default_glyphs[start].start;
+            let mut end = start + 1;
+            while end < default_glyphs.len() && default_glyphs[end].start == cluster {
+                end += 1;
+            }
+            cluster_count += 1;
+            found_multi_glyph_cluster |= end - start > 1;
+
+            assert_close(
+                tracked_glyphs[start].x_advance,
+                default_glyphs[start].x_advance + TRACKING_EM,
+            );
+            for index in start + 1..end {
+                assert_close(
+                    tracked_glyphs[index].x_advance,
+                    default_glyphs[index].x_advance,
+                );
+            }
+            start = end;
+        }
+
+        assert!(
+            found_multi_glyph_cluster,
+            "the test font must emit a separate Hebrew mark glyph"
+        );
+        let default_width = default.layout(32.0, None, Wrap::None, None, None)[0].w;
+        let tracked_width = tracked.layout(32.0, None, Wrap::None, None, None)[0].w;
+        assert_close(
+            tracked_width - default_width,
+            cluster_count as f32 * TRACKING_EM * 32.0,
+        );
+
+        // With RTL layout, x is decremented before each glyph is placed. The
+        // spacing-bearing glyph must therefore be first in stored visual
+        // order, so every glyph in a base+mark cluster moves together.
+        let default_layout = default.layout(32.0, Some(200.0), Wrap::None, None, None);
+        let tracked_layout = tracked.layout(32.0, Some(200.0), Wrap::None, None, None);
+        let default_layout = &default_layout[0].glyphs;
+        let tracked_layout = &tracked_layout[0].glyphs;
+        assert_eq!(default_layout.len(), tracked_layout.len());
+        let mut start = 0;
+        while start < default_layout.len() {
+            let cluster = default_layout[start].start;
+            let mut end = start + 1;
+            while end < default_layout.len() && default_layout[end].start == cluster {
+                end += 1;
+            }
+            let cluster_shift = tracked_layout[start].x - default_layout[start].x;
+            for index in start + 1..end {
+                assert_close(
+                    tracked_layout[index].x - default_layout[index].x,
+                    cluster_shift,
+                );
+            }
+            start = end;
+        }
+    }
+
+    #[test]
+    fn cursive_arabic_joins_are_preserved_but_space_is_tracked() {
+        let joined = "خالصة";
+        let default_joined = shape(joined, "Noto Sans Arabic", None);
+        let tracked_joined = shape(joined, "Noto Sans Arabic", Some(TRACKING_EM));
+        assert_same_shaping(&default_joined, &tracked_joined);
+
+        let text = "خالصة كلمة";
+        let space_start = text.find(' ').unwrap();
+        let default = shape(text, "Noto Sans Arabic", None);
+        let tracked = shape(text, "Noto Sans Arabic", Some(TRACKING_EM));
+        let default_glyphs = glyphs(&default);
+        let tracked_glyphs = glyphs(&tracked);
+        assert_eq!(default_glyphs.len(), tracked_glyphs.len());
+
+        let mut changed = 0;
+        for (default, tracked) in default_glyphs.into_iter().zip(tracked_glyphs) {
+            let delta = tracked.x_advance - default.x_advance;
+            if default.start == space_start {
+                assert_close(delta, TRACKING_EM);
+                changed += 1;
+            } else {
+                assert_close(delta, 0.0);
+            }
+        }
+        assert_eq!(changed, 1, "only the actual word separator is tracked");
+
+        let default_width = default.layout(32.0, None, Wrap::None, None, None)[0].w;
+        let tracked_width = tracked.layout(32.0, None, Wrap::None, None, None)[0].w;
+        assert_close(tracked_width - default_width, TRACKING_EM * 32.0);
     }
 }
