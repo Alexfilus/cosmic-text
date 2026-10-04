@@ -97,6 +97,19 @@ pub struct ShapeBuffer {
 
     /// Buffer for sets of layout glyphs.
     glyph_sets: Vec<Vec<LayoutGlyph>>,
+
+    /// Shape plans by face and segment properties. Building one compiles the
+    /// face's GSUB/GPOS lookups, which dominated shaping when done per run.
+    shape_plans: crate::HashMap<ShapePlanKey, rustybuzz::ShapePlan>,
+}
+
+#[derive(Clone, PartialEq, Eq, Hash)]
+struct ShapePlanKey {
+    font_id: crate::fontdb::ID,
+    direction: rustybuzz::Direction,
+    script: rustybuzz::Script,
+    language: Option<rustybuzz::Language>,
+    features: Vec<(rustybuzz::ttf_parser::Tag, u32)>,
 }
 
 impl fmt::Debug for ShapeBuffer {
@@ -197,24 +210,44 @@ fn shape_fallback(
     assert_eq!(rtl, span_rtl);
 
     let mut rb_font_features = Vec::new();
+    let mut feature_key = Vec::new();
 
     // Convert attrs::Feature to rustybuzz::Feature
     for feature in attrs.font_features.features {
-        rb_font_features.push(rustybuzz::Feature::new(
-            rustybuzz::ttf_parser::Tag::from_bytes(feature.tag.as_bytes()),
-            feature.value,
-            0..usize::MAX,
-        ));
+        let tag = rustybuzz::ttf_parser::Tag::from_bytes(feature.tag.as_bytes());
+        rb_font_features.push(rustybuzz::Feature::new(tag, feature.value, 0..usize::MAX));
+        feature_key.push((tag, feature.value));
     }
 
-    let shape_plan = rustybuzz::ShapePlan::new(
-        face,
-        buffer.direction(),
-        Some(buffer.script()),
-        buffer.language().as_ref(),
-        &rb_font_features,
-    );
-    let glyph_buffer = rustybuzz::shape_with_plan(face, &shape_plan, buffer);
+    let direction = buffer.direction();
+    let script = buffer.script();
+    let language = buffer.language();
+    let new_plan = || {
+        rustybuzz::ShapePlan::new(
+            face,
+            direction,
+            Some(script),
+            language.as_ref(),
+            &rb_font_features,
+        )
+    };
+    // A varied face is a per-span clone whose axis coordinates select their
+    // own feature variations, so only the shared default face is cached.
+    let varied_plan;
+    let shape_plan = if varied_face.is_some() {
+        varied_plan = new_plan();
+        &varied_plan
+    } else {
+        let key = ShapePlanKey {
+            font_id: font.id(),
+            direction,
+            script,
+            language: language.clone(),
+            features: feature_key,
+        };
+        &*scratch.shape_plans.entry(key).or_insert_with(new_plan)
+    };
+    let glyph_buffer = rustybuzz::shape_with_plan(face, shape_plan, buffer);
     let glyph_infos = glyph_buffer.glyph_infos();
     let glyph_positions = glyph_buffer.glyph_positions();
 
